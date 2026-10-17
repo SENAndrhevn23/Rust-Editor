@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 const GRID_ZOOM_VALUES: [f32; 17] = [0.25, 0.50, 0.75, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 96.0, 192.0];
 const CAMERA_ZOOM_VALUES: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+const MAX_SPAM_DENSITY: usize = u32::MAX as usize;
+const MAX_SPAM_ROWS_PER_ACTION: usize = 100_000;
 
 #[derive(Clone, Debug, Default)]
 struct Note {
@@ -256,15 +258,29 @@ impl ChartEditor {
     fn spam_generate(&mut self, lane_from: usize, lane_to: usize, density: usize, strength_rows: f64, start_row: usize, visual_rows: bool) {
         let from = lane_from.min(lane_to).min(self.song.mania.saturating_sub(1));
         let to = lane_from.max(lane_to).min(self.song.mania.saturating_sub(1));
-        let density = density.clamp(1, 2048);
+        let density = density.clamp(1, MAX_SPAM_DENSITY);
         let step_ms = if visual_rows { self.display_step_ms() } else { self.storage_step_ms() };
-        let start_ms = if visual_rows { start_row as f64 * step_ms } else { start_row as f64 * step_ms };
+        let start_ms = start_row as f64 * step_ms;
         let strength = strength_rows.max(0.03125);
         let end_ms = start_ms + strength * step_ms;
+
+        // The input accepts the full unsigned 32-bit range. Generating billions of
+        // notes in one action would exhaust memory, so cap a single operation at
+        // 100,000 rows and reduce the effective density evenly when necessary.
+        let requested_rows = (strength * density as f64).ceil();
+        let density_was_limited = requested_rows > MAX_SPAM_ROWS_PER_ACTION as f64;
+        let effective_density = if density_was_limited {
+            ((MAX_SPAM_ROWS_PER_ACTION as f64 / strength).floor() as usize).max(1).min(density)
+        } else {
+            density
+        };
+        let row_count = (strength * effective_density as f64)
+            .ceil()
+            .min(MAX_SPAM_ROWS_PER_ACTION as f64) as usize;
+
         let sec = self.current_section_mut();
         sec.notes.retain(|n| !(n.lane >= from && n.lane <= to && n.time_ms >= start_ms && n.time_ms < end_ms));
-        let step_fraction = 1.0 / density as f64;
-        let row_count = (strength * density as f64).ceil().min(100_000.0) as usize;
+        let step_fraction = 1.0 / effective_density as f64;
         for i in 0..row_count {
             let offset = i as f64 * step_fraction;
             if offset >= strength { break; }
@@ -274,7 +290,15 @@ impl ChartEditor {
             }
         }
         self.selected_note = None;
-        self.set_status(format!("Generated {} notes in the selected range.", row_count.saturating_mul(to - from + 1)));
+        let generated_count = row_count.saturating_mul(to - from + 1);
+        if density_was_limited {
+            self.set_status(format!(
+                "Generated {} notes. Effective density was reduced to {} per row to keep this action within {} grid rows.",
+                generated_count, effective_density, MAX_SPAM_ROWS_PER_ACTION
+            ));
+        } else {
+            self.set_status(format!("Generated {} notes in the selected range.", generated_count));
+        }
     }
 
     fn swap_sides(&mut self) {
@@ -698,7 +722,7 @@ impl ChartEditor {
                 ui.label("E: make / extend long note; P: extend by one grid row.");
             }
             "Spamming" => {
-                ui.label("Spam Density (notes per grid row):"); ui.add(egui::DragValue::new(&mut self.spam_density).range(1..=2048));
+                ui.label("Spam Density (notes per grid row, max 4,294,967,295):"); ui.add(egui::DragValue::new(&mut self.spam_density).range(1..=MAX_SPAM_DENSITY));
                 ui.label("Spam Strength (grid rows to fill):"); ui.add(egui::DragValue::new(&mut self.spam_strength).speed(0.25).range(0.03125..=4096.0));
                 ui.label("Lane range for spam:");
                 ui.horizontal(|ui| { ui.label("From"); ui.add(egui::DragValue::new(&mut self.spam_lane_from).range(0..=self.song.mania.saturating_sub(1))); ui.label("To"); ui.add(egui::DragValue::new(&mut self.spam_lane_to).range(0..=self.song.mania.saturating_sub(1))); });
