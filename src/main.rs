@@ -765,30 +765,77 @@ impl ChartEditor {
         }
 
         let step_ms = self.display_step_ms().max(0.0001);
-        // Draw compressed regions symbolically. The visualization stays constant-size
-        // regardless of whether the pattern represents thousands or 10^308 notes.
+        let alpha = (self.note_opacity * 255.0).clamp(0.0, 255.0) as u8;
+
+        // Compressed spam is drawn with the same original arrow sprites as regular
+        // notes. Never paint a blue placeholder block: only render the note images
+        // that can be seen in the viewport. Astronomical densities are sampled into
+        // a handful of sprite layers per lane/row so 10^308 counts stay inexpensive.
+        const MAX_COMPRESSED_SPRITE_SAMPLES: usize = 4;
+        let visible_rows = grid_rect.height() / row_h.max(1.0);
         for pattern in self.song.compressed_patterns.iter().filter(|p| p.section_index == self.current_section) {
-            if pattern.lane_from >= lane_count || pattern.lane_to >= lane_count { continue; }
-            let start_row = (pattern.start_ms / step_ms) as f32;
-            let end_row = ((pattern.start_ms + pattern.row_step_ms * pattern.rows as f64) / step_ms) as f32;
-            let y0 = grid_top + (start_row - self.scroll_row_offset) * row_h;
-            let y1 = grid_top + (end_row - self.scroll_row_offset) * row_h;
-            let x0 = grid_left + pattern.lane_from as f32 * lane_w - self.camera_x_offset;
-            let x1 = grid_left + (pattern.lane_to + 1) as f32 * lane_w - self.camera_x_offset;
-            let region = Rect::from_min_max(Pos2::new(x0, y0.min(y1)), Pos2::new(x1, y0.max(y1)));
-            if region.intersects(grid_rect) {
-                clipped.rect_filled(region, 2.0, Color32::from_rgba_unmultiplied(26, 106, 188, 72));
-                clipped.rect_stroke(region, 2.0, Stroke::new(1.5, Color32::from_rgb(50, 145, 255)), egui::StrokeKind::Inside);
-                if region.width() > 90.0 && region.height() > 22.0 {
-                    clipped.text(
-                        Pos2::new(region.left() + 4.0, region.top() + 3.0), egui::Align2::LEFT_TOP,
-                        format!("COMPRESSED ×{}", compact_count(&pattern.density)),
-                        FontId::proportional(10.0), Color32::from_rgb(224, 238, 255),
-                    );
+            if pattern.lane_from >= lane_count || pattern.lane_to >= lane_count || pattern.rows == 0 {
+                continue;
+            }
+            let pattern_start_row = (pattern.start_ms / step_ms) as f32;
+            let row_stride = (pattern.row_step_ms / step_ms) as f32;
+            if !row_stride.is_finite() || row_stride <= 0.0 {
+                continue;
+            }
+
+            // Restrict work to rows that overlap the current viewport, with one-row
+            // padding for note sprites that partially overlap a clip boundary.
+            let first_visible = (((self.scroll_row_offset - pattern_start_row - 1.0) / row_stride)
+                .floor().max(0.0) as usize).min(pattern.rows);
+            let last_visible = (((self.scroll_row_offset + visible_rows + 1.0 - pattern_start_row) / row_stride)
+                .ceil().max(0.0) as usize).min(pattern.rows);
+            if first_visible >= last_visible { continue; }
+
+            let density = pattern.density.parse::<usize>().unwrap_or(usize::MAX);
+            let sample_count = density.max(1).min(MAX_COMPRESSED_SPRITE_SAMPLES);
+            for lane in pattern.lane_from..=pattern.lane_to {
+                let x = grid_left + lane as f32 * lane_w - self.camera_x_offset;
+                // Skip offscreen lanes before creating any image draw calls.
+                if x + lane_w < grid_rect.left() || x > grid_rect.right() { continue; }
+                let texture = if self.textures.len() >= 8 {
+                    Some(&self.textures[4 + (lane % 4)])
+                } else {
+                    None
+                };
+                for row_index in first_visible..last_visible {
+                    let display_row = pattern_start_row + row_index as f32 * row_stride;
+                    let base_y = grid_top + (display_row - self.scroll_row_offset) * row_h;
+                    for sample in 0..sample_count {
+                        // Evenly sample the represented density across the row. A very
+                        // large count still produces recognizable source note sprites.
+                        let fraction = sample as f32 / sample_count as f32;
+                        let note_rect = Rect::from_min_size(
+                            Pos2::new(x, base_y + fraction * row_h),
+                            Vec2::new(lane_w, row_h),
+                        );
+                        if note_rect.bottom() < grid_rect.top() || note_rect.top() > grid_rect.bottom() {
+                            continue;
+                        }
+                        if let Some(texture) = texture {
+                            clipped.image(
+                                texture.id(),
+                                note_rect,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::from_white_alpha(alpha),
+                            );
+                        } else {
+                            // Fallback only if an embedded image failed to load; don't
+                            // reintroduce the old blue rectangle placeholder.
+                            clipped.rect_filled(
+                                note_rect.shrink(2.0),
+                                1.0,
+                                Color32::from_white_alpha(alpha),
+                            );
+                        }
+                    }
                 }
             }
         }
-        let alpha = (self.note_opacity * 255.0).clamp(0.0, 255.0) as u8;
         for (idx, note) in section_notes.iter().enumerate() {
             if note.lane >= lane_count {
                 continue;
