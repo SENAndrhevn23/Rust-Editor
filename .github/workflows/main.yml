@@ -1,0 +1,119 @@
+name: Rust Editor CI
+
+on:
+  push:
+    branches: ["**"]
+    tags:
+      - "v0.0.1"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            artifact_name: rust-editor-0.0.1-linux-x86_64
+            package_name: rust-editor-0.0.1-linux-x86_64.tar.gz
+          - os: windows-latest
+            platform: windows-x86_64
+            artifact_name: rust-editor-0.0.1-windows-x86_64
+            package_name: rust-editor-0.0.1-windows-x86_64.zip
+          - os: macos-latest
+            platform: macos-aarch64
+            artifact_name: rust-editor-0.0.1-macos-aarch64
+            package_name: rust-editor-0.0.1-macos-aarch64.tar.gz
+          - os: macos-15-intel
+            platform: macos-x86_64
+            artifact_name: rust-editor-0.0.1-macos-x86_64
+            package_name: rust-editor-0.0.1-macos-x86_64.tar.gz
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            pkg-config \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libgl1-mesa-dev
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Package Linux/macOS binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/${{ matrix.package_name }}" rust-editor
+
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive `
+            -Path "target/release/rust-editor.exe" `
+            -DestinationPath "dist/${{ matrix.package_name }}" `
+            -Force
+
+      - name: Upload packaged build
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish v0.0.1 release
+    if: github.ref == 'refs/tags/v0.0.1'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: rust-editor-0.0.1-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.0.1 >/dev/null 2>&1; then
+            gh release upload v0.0.1 dist/* --clobber
+          else
+            gh release create v0.0.1 dist/* \
+              --title "Rust Editor v0.0.1" \
+              --generate-notes
+          fi
