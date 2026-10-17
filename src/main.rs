@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 const GRID_ZOOM_VALUES: [f32; 17] = [0.25, 0.50, 0.75, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 96.0, 192.0];
 const CAMERA_ZOOM_VALUES: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
-const MAX_MATERIALIZED_NOTES_PER_ACTION: usize = 100_000;
+const MAX_MATERIALIZED_NOTES_PER_ACTION: usize = 1_000_000;
 const MAX_COMPRESSED_PATTERN_ROWS: usize = 4_096;
 const MAX_DENSITY_DECIMAL_EXPONENT: usize = 308;
 const MAX_UNDO_STEPS: usize = 32;
@@ -373,32 +373,53 @@ impl ChartEditor {
         let from = lane_from.min(lane_to).min(self.song.mania.saturating_sub(1));
         let to = lane_from.max(lane_to).min(self.song.mania.saturating_sub(1));
         let lane_count = to.saturating_sub(from).saturating_add(1);
+        let strength = strength_rows.max(0.03125).min(MAX_COMPRESSED_PATTERN_ROWS as f64);
+
+        // Spam density means real Note objects. Never replace an oversized request
+        // with a symbolic/compressed pattern: refuse it before touching chart data.
+        let effective_density = match density.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                self.set_status(format!(
+                    "Density {} is too large to materialize as individual notes. Maximum: {} actual notes per action; nothing was changed.",
+                    compact_count(&density), MAX_MATERIALIZED_NOTES_PER_ACTION
+                ));
+                return;
+            }
+        };
+        let rows_f = (strength * effective_density as f64).ceil();
+        if !rows_f.is_finite() || rows_f < 1.0 || rows_f > MAX_MATERIALIZED_NOTES_PER_ACTION as f64 {
+            self.set_status(format!(
+                "This spam request exceeds the limit of {} actual notes per action. No compressed pattern was created; nothing was changed.",
+                MAX_MATERIALIZED_NOTES_PER_ACTION
+            ));
+            return;
+        }
+        let row_count = rows_f as usize;
+        let note_count = match row_count.checked_mul(lane_count) {
+            Some(count) if count <= MAX_MATERIALIZED_NOTES_PER_ACTION => count,
+            _ => {
+                self.set_status(format!(
+                    "This spam request exceeds the limit of {} actual notes per action. No compressed pattern was created; nothing was changed.",
+                    MAX_MATERIALIZED_NOTES_PER_ACTION
+                ));
+                return;
+            }
+        };
+
         let step_ms = if visual_rows { self.display_step_ms() } else { self.storage_step_ms() };
         let start_ms = start_row as f64 * step_ms;
-        let strength = strength_rows.max(0.03125).min(MAX_COMPRESSED_PATTERN_ROWS as f64);
-        let rounded_rows = strength.ceil().max(1.0).min(MAX_COMPRESSED_PATTERN_ROWS as f64) as usize;
-
-        // Materialize only when the full operation is small. Bigger operations are
-        // stored as one compact pattern record, not thousands/millions/billions of
-        // individual Note structs. This supports exact density values through 10^308.
-        let density_usize = density.parse::<usize>().ok();
-        let materialized_row_count = density_usize.and_then(|d| {
-            let rows_f = (strength * d as f64).ceil();
-            if !rows_f.is_finite() || rows_f < 1.0 || rows_f > usize::MAX as f64 { return None; }
-            let rows = rows_f as usize;
-            let note_count = rows.checked_mul(lane_count)?;
-            if note_count <= MAX_MATERIALIZED_NOTES_PER_ACTION { Some((d, rows, note_count)) } else { None }
-        });
-
-        // Replace overlapping content in the selected lane/time area, as the old
-        // spam tool did. Overlapping compressed patterns are removed atomically.
         let end_ms = start_ms + strength * step_ms;
         let section_index = self.current_section;
+
+        // Only mutate the chart once the full operation is known to fit in memory.
         self.record_undo();
         {
             let sec = self.current_section_mut();
             sec.notes.retain(|n| !(n.lane >= from && n.lane <= to && n.time_ms >= start_ms && n.time_ms < end_ms));
         }
+        // Remove any overlapping patterns from older project files; new spam is
+        // always written as ordinary notes, never as a compressed pattern record.
         self.song.compressed_patterns.retain(|p| {
             let p_end = p.start_ms + p.row_step_ms * p.rows as f64;
             !(p.section_index == section_index
@@ -406,36 +427,21 @@ impl ChartEditor {
                 && p.start_ms < end_ms && p_end > start_ms)
         });
 
-        if let Some((effective_density, row_count, note_count)) = materialized_row_count {
-            let sec = self.current_section_mut();
-            let step_fraction = 1.0 / effective_density as f64;
-            for i in 0..row_count {
-                let offset = i as f64 * step_fraction;
-                if offset >= strength { break; }
-                let time = start_ms + offset * step_ms;
-                for lane in from..=to {
-                    sec.notes.push(Note { time_ms: time, lane, sustain_ms: 0.0 });
-                }
+        let step_fraction = 1.0 / effective_density as f64;
+        let sec = self.current_section_mut();
+        sec.notes.reserve(note_count);
+        for i in 0..row_count {
+            let offset = i as f64 * step_fraction;
+            if offset >= strength { break; }
+            let time = start_ms + offset * step_ms;
+            for lane in from..=to {
+                sec.notes.push(Note { time_ms: time, lane, sustain_ms: 0.0 });
             }
-            self.selected_note = None;
-            self.set_status(format!("Generated {note_count} individual notes in the selected range."));
-        } else {
-            self.song.compressed_patterns.push(CompressedSpamPattern {
-                section_index,
-                start_ms,
-                row_step_ms: step_ms,
-                rows: rounded_rows,
-                density: density.clone(),
-                lane_from: from,
-                lane_to: to,
-            });
-            self.selected_note = None;
-            let represented = decimal_mul_small(&density, (rounded_rows as u64).saturating_mul(lane_count as u64));
-            self.set_status(format!(
-                "Stored compressed spam pattern: {} notes represented (density {} per row, {} rows, {} lanes). It was not expanded into individual note objects.",
-                compact_count(&represented), compact_count(&density), rounded_rows, lane_count
-            ));
         }
+        self.selected_note = None;
+        self.set_status(format!(
+            "Generated {note_count} individual note objects. No compressed spam was created."
+        ));
     }
 
     fn swap_sides(&mut self) {
@@ -563,23 +569,29 @@ impl ChartEditor {
             sections.push(json!({ "lengthInSteps": sec.length_in_steps.max(1), "mustHitSection": sec.must_hit_section, "sectionNotes": tuples }));
             start_ms += sec.length_in_steps.max(1) as f64 * self.storage_step_ms();
         }
-        let root = json!({ "song": {
+        let mut song_json = json!({
             "song": self.song.song, "bpm": self.safe_bpm(), "needsVoices": self.song.needs_voices,
             "player1": self.song.player1, "player2": self.song.player2, "gfVersion": self.song.gf_version,
             "speed": self.song.speed, "mania": self.song.mania.clamp(2, 64), "notes": sections,
-            "rustEditorCompressedPatterns": self.song.compressed_patterns.iter().map(|p| json!({
+            "generatedBy": "Rust Editor"
+        });
+        // The ordinary export contains individual sectionNotes only. Keep this
+        // private extension solely when an older project with legacy patterns is
+        // open, so it is not silently stripped while that chart is being edited.
+        if !self.song.compressed_patterns.is_empty() {
+            song_json["rustEditorCompressedPatterns"] = json!(self.song.compressed_patterns.iter().map(|p| json!({
                 "sectionIndex": p.section_index, "startMs": p.start_ms, "rowStepMs": p.row_step_ms,
                 "rows": p.rows, "density": p.density, "laneFrom": p.lane_from, "laneTo": p.lane_to
-            })).collect::<Vec<Value>>(),
-            "generatedBy": "Rust Editor"
-        }});
+            })).collect::<Vec<Value>>());
+        }
+        let root = json!({ "song": song_json });
         let mut file = File::create(path).map_err(|e| e.to_string())?;
         serde_json::to_writer_pretty(&mut file, &root).map_err(|e| e.to_string())?;
         file.write_all(b"\n").map_err(|e| e.to_string())
     }
     fn save_binary(&self, path: &Path) -> Result<(), String> {
         if !self.song.compressed_patterns.is_empty() {
-            return Err("This BIN format cannot preserve compressed astronomical spam patterns. Save as JSON to retain them in Rust Editor metadata.".into());
+            return Err("This BIN format cannot preserve legacy compressed spam metadata. New spam operations create individual note objects; remove or regenerate legacy patterns before BIN export.".into());
         }
         let tmp = path.with_extension(format!("{}.saving", path.extension().unwrap_or_default().to_string_lossy()));
         let mut out = File::create(&tmp).map_err(|e| e.to_string())?;
@@ -973,12 +985,12 @@ impl ChartEditor {
                 ui.label("E: make / extend long note; P: extend by one grid row.");
             }
             "Spamming" => {
-                ui.label("Spam Density (exact integer per grid row; supports up to 10^308):");
+                ui.label("Spam Density (actual note count per grid row):");
                 ui.horizontal(|ui| {
                     ui.label("Density");
                     ui.add(egui::TextEdit::singleline(&mut self.spam_density_text).desired_width(220.0).font(egui::TextStyle::Monospace));
                 });
-                ui.small("Examples: 2048, 4294967295, 1e308, 10^308, or 10³⁰⁸. Huge counts are stored symbolically, not expanded into individual notes.");
+                ui.small("Density creates actual note objects, not a compressed pattern. Maximum: 1,000,000 notes per spam action; larger requests are rejected without changing the chart.");
                 ui.label("Spam Strength (grid rows to fill):"); ui.add(egui::DragValue::new(&mut self.spam_strength).speed(0.25).range(0.03125..=4096.0));
                 ui.label("Lane range for spam:");
                 ui.horizontal(|ui| { ui.label("From"); ui.add(egui::DragValue::new(&mut self.spam_lane_from).range(0..=self.song.mania.saturating_sub(1))); ui.label("To"); ui.add(egui::DragValue::new(&mut self.spam_lane_to).range(0..=self.song.mania.saturating_sub(1))); });
@@ -1212,13 +1224,13 @@ fn normalize_count_input(input: &str) -> Result<String, String> {
         "10³⁰⁸" | "10^308" | "1×10³⁰⁸" | "1x10^308" => "1e308".to_string(),
         _ => compact.clone(),
     };
-    if alias.is_empty() { return Err("Enter a density count (for example 2048 or 1e308).".into()); }
+    if alias.is_empty() { return Err("Enter a positive whole-number density count, such as 2048.".into()); }
 
     // Treat 10^N as a convenient exact power-of-ten expression.
     if let Some((base, exponent)) = alias.split_once('^') {
         if base != "10" { return Err("Power notation must look like 10^308.".into()); }
         let exponent: usize = exponent.parse().map_err(|_| "Invalid power exponent.".to_string())?;
-        if exponent > MAX_DENSITY_DECIMAL_EXPONENT { return Err("Density exceeds the supported maximum of 10^308.".into()); }
+        if exponent > MAX_DENSITY_DECIMAL_EXPONENT { return Err("Density exceeds the supported input maximum of 10^308; this does not mean that many individual notes can be allocated.".into()); }
         return Ok(format!("1{}", "0".repeat(exponent)));
     }
 
@@ -1237,7 +1249,7 @@ fn normalize_count_input(input: &str) -> Result<String, String> {
         match ch {
             '0'..='9' => { digits.push(ch); if !seen_dot { digits_before_dot += 1; } }
             '.' if !seen_dot => seen_dot = true,
-            _ => return Err("Use an integer, 1e308, or 10^308 for density.".into()),
+            _ => return Err("Use a positive integer density count. The spam tool creates actual note records and rejects operations that exceed its limit.".into()),
         }
     }
     if digits.is_empty() { return Err("Density must be a positive integer.".into()); }
@@ -1252,7 +1264,7 @@ fn normalize_count_input(input: &str) -> Result<String, String> {
     } else if decimal_position > digits.len() {
         let zero_count = decimal_position - digits.len();
         if digits.len() + zero_count > MAX_DENSITY_DECIMAL_EXPONENT + 1 {
-            return Err("Density exceeds the supported maximum of 10^308.".into());
+            return Err("Density exceeds the supported input maximum of 10^308; this does not mean that many individual notes can be allocated.".into());
         }
         digits.push_str(&"0".repeat(zero_count));
     }
@@ -1260,7 +1272,7 @@ fn normalize_count_input(input: &str) -> Result<String, String> {
     if normalized.is_empty() || normalized == "0" { return Err("Density must be at least 1.".into()); }
     let max = format!("1{}", "0".repeat(MAX_DENSITY_DECIMAL_EXPONENT));
     if normalized.len() > max.len() || (normalized.len() == max.len() && normalized.as_str() > max.as_str()) {
-        return Err("Density exceeds the supported maximum of 10^308.".into());
+        return Err("Density exceeds the supported input maximum of 10^308; this does not mean that many individual notes can be allocated.".into());
     }
     Ok(normalized)
 }
