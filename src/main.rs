@@ -9,9 +9,14 @@ use std::time::{Duration, Instant};
 
 const GRID_ZOOM_VALUES: [f32; 17] = [0.25, 0.50, 0.75, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 96.0, 192.0];
 const CAMERA_ZOOM_VALUES: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
-const MAX_MATERIALIZED_NOTES_PER_ACTION: usize = 1_000_000;
+// This is a materialization threshold, not a chart-size limit. Requests above it
+// use a compact symbolic pattern so very dense charts do not allocate millions
+// or billions of individual Rust objects.
+const MATERIALIZE_NOTE_THRESHOLD: usize = 1_000_000;
 const MAX_COMPRESSED_PATTERN_ROWS: usize = 4_096;
-const MAX_DENSITY_DECIMAL_EXPONENT: usize = 308;
+// Accept extremely large finite densities while protecting the editor from
+// malformed inputs that would ask it to construct gigantic decimal strings.
+const MAX_DENSITY_DECIMAL_EXPONENT: usize = 100_000;
 const MAX_UNDO_STEPS: usize = 32;
 
 #[derive(Clone, Debug, Default)]
@@ -22,16 +27,29 @@ struct Note {
 }
 
 /// A symbolic spam region. `density` is an exact decimal integer, so it can
-/// represent values such as 10^308 without allocating one Note per event.
+/// represent values vastly larger than machine integers without allocating one
+/// Note per event.
 #[derive(Clone, Debug)]
 struct CompressedSpamPattern {
     section_index: usize,
     start_ms: f64,
     row_step_ms: f64,
     rows: usize,
+    // Exact density integer, represented as decimal text rather than a machine integer.
     density: String,
+    // Actual duration in pattern rows; may be fractional for partial-strength spam.
+    strength_rows: f64,
+    // Exact number of events per lane represented by this pattern.
+    // This avoids rounding huge decimal densities through f64.
+    note_count_per_lane: String,
     lane_from: usize,
     lane_to: usize,
+}
+
+impl CompressedSpamPattern {
+    fn end_ms(&self) -> f64 {
+        self.start_ms + self.row_step_ms * self.strength_rows
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +89,7 @@ struct AllClipboard { sections: Vec<Section> }
 
 /// Undo snapshots store the chart data, not audio playback or view preferences.
 /// Compressed spam patterns remain cheap to snapshot even when they represent
-/// values such as 10^308 notes.
+/// values such as 10^100000 notes.
 #[derive(Clone)]
 struct EditorSnapshot {
     song: SongData,
@@ -127,6 +145,37 @@ struct ChartEditor {
     textures: Vec<egui::TextureHandle>,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
+}
+
+/// Return the distance from a pointer row to a note's head center when the
+/// pointer falls within the note head or its sustain tail. The editor draws
+/// notes at their exact stored time, so hit-testing must use that same position
+/// rather than a snapped grid cell.
+fn note_hit_distance(note: &Note, lane: usize, pointer_row: f64, step_ms: f64) -> Option<f64> {
+    if note.lane != lane
+        || !pointer_row.is_finite()
+        || !step_ms.is_finite()
+        || step_ms <= 0.0
+        || !note.time_ms.is_finite()
+    {
+        return None;
+    }
+
+    let note_row = note.time_ms / step_ms;
+    let sustain_rows = if note.sustain_ms.is_finite() {
+        (note.sustain_ms / step_ms).max(0.0)
+    } else {
+        0.0
+    };
+    // Note heads occupy one visual row. Sustains extend the hit area downward
+    // to match the tail drawn by the renderer. A little slack helps at edges.
+    let hit_end_row = note_row + sustain_rows.max(1.0);
+    let edge_slack = 0.04;
+    if pointer_row < note_row - edge_slack || pointer_row > hit_end_row + edge_slack {
+        return None;
+    }
+
+    Some((pointer_row - (note_row + 0.5)).abs())
 }
 
 impl ChartEditor {
@@ -252,11 +301,10 @@ impl ChartEditor {
         let mut total = physical.to_string();
         for pattern in &self.song.compressed_patterns {
             let lane_count = pattern.lane_to.saturating_sub(pattern.lane_from).saturating_add(1) as u64;
-            let multiplier = (pattern.rows as u64).saturating_mul(lane_count);
-            let represented = decimal_mul_small(&pattern.density, multiplier);
+            let represented = decimal_mul_small(&pattern.note_count_per_lane, lane_count);
             total = decimal_add(&total, &represented);
         }
-        compact_count(&total)
+        format_count_for_display(&total)
     }
     fn selected_note(&self) -> Option<&Note> { self.selected_note.and_then(|i| self.song.notes.get(self.current_section)?.notes.get(i)) }
 
@@ -324,27 +372,34 @@ impl ChartEditor {
     fn click_grid(&mut self, lane: usize, display_row: f64, right_click: bool) {
         if lane >= self.song.mania { return; }
         let step_ms = self.display_step_ms().max(0.0001);
-        let relative_time = (display_row * step_ms).max(0.0);
-        let tolerance = if right_click { (step_ms * 0.45).max(0.5) } else { (step_ms * 0.20).max(0.05) };
-        let existing = self.song.notes[self.current_section].notes.iter().position(|n| n.lane == lane && (n.time_ms - relative_time).abs() <= tolerance);
+        // Preserve snapped placement for new notes, but use the unsnapped pointer
+        // row to select/delete notes at their real stored (possibly off-grid) time.
+        let pointer_row = display_row.max(0.0);
+        let snapped_time = pointer_row.floor() * step_ms;
+        let existing = self.song.notes[self.current_section].notes.iter()
+            .enumerate()
+            .filter_map(|(i, note)| {
+                note_hit_distance(note, lane, pointer_row, step_ms).map(|distance| (i, distance))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i);
         if right_click {
             if let Some(i) = existing {
                 self.record_undo();
                 self.song.notes[self.current_section].notes.remove(i);
                 self.selected_note = None;
-                self.set_status(format!("Removed note in lane {lane}."));
+                self.set_status(format!("Removed note in lane {lane}, including off-grid notes."));
             }
         } else if self.ez_spam {
             let density = self.spam_density_text.clone();
             let strength = self.spam_strength.floor().max(1.0);
-            self.spam_generate(lane, lane, &density, strength, display_row as usize, true);
+            self.spam_generate(lane, lane, &density, strength, pointer_row as usize, true);
         } else if let Some(i) = existing {
             self.selected_note = Some(i);
             self.sustain_ms = self.song.notes[self.current_section].notes[i].sustain_ms;
-            self.set_status(format!("Selected note {} in lane {}.", i + 1, lane));
+            self.set_status(format!("Selected note {} in lane {}.", format_count_with_commas(&(i + 1).to_string()), lane));
         } else {
-            let storage_step = self.storage_step_ms();
-            let time = relative_time.min(self.section_duration_ms(self.current_section).max(0.0));
+            let time = snapped_time.min(self.section_duration_ms(self.current_section).max(0.0));
             self.record_undo();
             let sec = self.current_section_mut();
             sec.notes.push(Note { time_ms: time, lane, sustain_ms: 0.0 });
@@ -352,7 +407,6 @@ impl ChartEditor {
             self.selected_note = Some(new_index);
             self.sustain_ms = 0.0;
             self.set_status(format!("Added note in lane {lane}, at {:.2} ms.", self.section_start_ms(self.current_section) + time));
-            let _ = storage_step;
         }
     }
 
@@ -374,37 +428,24 @@ impl ChartEditor {
         let to = lane_from.max(lane_to).min(self.song.mania.saturating_sub(1));
         let lane_count = to.saturating_sub(from).saturating_add(1);
         let strength = strength_rows.max(0.03125).min(MAX_COMPRESSED_PATTERN_ROWS as f64);
+        let row_count = strength.ceil() as usize;
+        let count_per_lane = decimal_ceil_mul_f64(&density, strength);
+        let total_count = decimal_mul_small(&count_per_lane, lane_count as u64);
 
-        // Spam density means real Note objects. Never replace an oversized request
-        // with a symbolic/compressed pattern: refuse it before touching chart data.
-        let effective_density = match density.parse::<usize>() {
-            Ok(value) if value > 0 => value,
-            _ => {
-                self.set_status(format!(
-                    "Density {} is too large to materialize as individual notes. Maximum: {} actual notes per action; nothing was changed.",
-                    compact_count(&density), MAX_MATERIALIZED_NOTES_PER_ACTION
-                ));
-                return;
+        // Keep ordinary notes for small requests so each note is directly editable.
+        // For bigger requests, switch to a compact pattern instead of refusing the
+        // action or allocating one Note value for every represented event.
+        let materialized = match (
+            density.parse::<usize>(),
+            count_per_lane.parse::<usize>(),
+            total_count.parse::<usize>(),
+        ) {
+            (Ok(density_usize), Ok(row_events), Ok(total))
+                if density_usize > 0 && row_events > 0 && total <= MATERIALIZE_NOTE_THRESHOLD =>
+            {
+                Some((density_usize, row_events, total))
             }
-        };
-        let rows_f = (strength * effective_density as f64).ceil();
-        if !rows_f.is_finite() || rows_f < 1.0 || rows_f > MAX_MATERIALIZED_NOTES_PER_ACTION as f64 {
-            self.set_status(format!(
-                "This spam request exceeds the limit of {} actual notes per action. No compressed pattern was created; nothing was changed.",
-                MAX_MATERIALIZED_NOTES_PER_ACTION
-            ));
-            return;
-        }
-        let row_count = rows_f as usize;
-        let note_count = match row_count.checked_mul(lane_count) {
-            Some(count) if count <= MAX_MATERIALIZED_NOTES_PER_ACTION => count,
-            _ => {
-                self.set_status(format!(
-                    "This spam request exceeds the limit of {} actual notes per action. No compressed pattern was created; nothing was changed.",
-                    MAX_MATERIALIZED_NOTES_PER_ACTION
-                ));
-                return;
-            }
+            _ => None,
         };
 
         let step_ms = if visual_rows { self.display_step_ms() } else { self.storage_step_ms() };
@@ -412,36 +453,52 @@ impl ChartEditor {
         let end_ms = start_ms + strength * step_ms;
         let section_index = self.current_section;
 
-        // Only mutate the chart once the full operation is known to fit in memory.
         self.record_undo();
         {
             let sec = self.current_section_mut();
             sec.notes.retain(|n| !(n.lane >= from && n.lane <= to && n.time_ms >= start_ms && n.time_ms < end_ms));
         }
-        // Remove any overlapping patterns from older project files; new spam is
-        // always written as ordinary notes, never as a compressed pattern record.
+        // Replace only overlapping compressed patterns; unrelated sections and lanes survive.
         self.song.compressed_patterns.retain(|p| {
-            let p_end = p.start_ms + p.row_step_ms * p.rows as f64;
             !(p.section_index == section_index
                 && p.lane_from <= to && p.lane_to >= from
-                && p.start_ms < end_ms && p_end > start_ms)
+                && p.start_ms < end_ms && p.end_ms() > start_ms)
         });
 
-        let step_fraction = 1.0 / effective_density as f64;
-        let sec = self.current_section_mut();
-        sec.notes.reserve(note_count);
-        for i in 0..row_count {
-            let offset = i as f64 * step_fraction;
-            if offset >= strength { break; }
-            let time = start_ms + offset * step_ms;
-            for lane in from..=to {
-                sec.notes.push(Note { time_ms: time, lane, sustain_ms: 0.0 });
+        if let Some((effective_density, row_events, note_count)) = materialized {
+            let step_fraction = 1.0 / effective_density as f64;
+            let sec = self.current_section_mut();
+            sec.notes.reserve(note_count);
+            for i in 0..row_events {
+                let offset = i as f64 * step_fraction;
+                if offset >= strength { break; }
+                let time = start_ms + offset * step_ms;
+                for lane in from..=to {
+                    sec.notes.push(Note { time_ms: time, lane, sustain_ms: 0.0 });
+                }
             }
+            self.selected_note = None;
+            self.set_status(format!("Generated {} individual note objects.", format_count_with_commas(&note_count.to_string())));
+        } else {
+            // Store arbitrarily dense finite counts symbolically. Rendering samples a
+            // handful of sprites per visible row, while the exact count remains a string.
+            self.song.compressed_patterns.push(CompressedSpamPattern {
+                section_index,
+                start_ms,
+                row_step_ms: step_ms,
+                rows: row_count.max(1).min(MAX_COMPRESSED_PATTERN_ROWS),
+                density,
+                strength_rows: strength,
+                note_count_per_lane: count_per_lane,
+                lane_from: from,
+                lane_to: to,
+            });
+            self.selected_note = None;
+            self.set_status(format!(
+                "Represented {} notes as a compressed pattern to avoid a huge memory allocation. Large patterns are preserved by Rust Editor's JSON extension.",
+                format_count_for_display(&total_count)
+            ));
         }
-        self.selected_note = None;
-        self.set_status(format!(
-            "Generated {note_count} individual note objects. No compressed spam was created."
-        ));
     }
 
     fn swap_sides(&mut self) {
@@ -488,7 +545,7 @@ impl ChartEditor {
     }
     fn copy_current_section(&mut self) {
         self.copied_section = Some(SectionClipboard { section: self.song.notes[self.current_section].clone() });
-        self.set_status(format!("Copied section {} ({} notes).", self.current_section, self.song.notes[self.current_section].notes.len()));
+        self.set_status(format!("Copied section {} ({} notes).", format_count_with_commas(&self.current_section.to_string()), format_count_with_commas(&self.song.notes[self.current_section].notes.len().to_string())));
     }
     fn paste_section_here(&mut self) {
         if let Some(c) = self.copied_section.clone() {
@@ -510,7 +567,7 @@ impl ChartEditor {
     fn copy_all_notes(&mut self) {
         let secs = self.song.notes.iter().filter(|s| !s.notes.is_empty()).cloned().collect::<Vec<_>>();
         self.copied_all = Some(AllClipboard { sections: secs.clone() });
-        self.set_status(format!("Copied {} non-empty sections ({} notes).", secs.len(), secs.iter().map(|s| s.notes.len()).sum::<usize>()));
+        self.set_status(format!("Copied {} non-empty sections ({} notes).", format_count_with_commas(&secs.len().to_string()), format_count_with_commas(&secs.iter().map(|s| s.notes.len()).sum::<usize>().to_string())));
     }
     fn paste_all_notes(&mut self) {
         let copied = match self.copied_all.clone() { Some(c) if !c.sections.is_empty() => c, _ => { self.set_status("Copy all notes first."); return; } };
@@ -575,13 +632,15 @@ impl ChartEditor {
             "speed": self.song.speed, "mania": self.song.mania.clamp(2, 64), "notes": sections,
             "generatedBy": "Rust Editor"
         });
-        // The ordinary export contains individual sectionNotes only. Keep this
-        // private extension solely when an older project with legacy patterns is
-        // open, so it is not silently stripped while that chart is being edited.
+        // Standard sectionNotes stays interoperable for ordinary charts. Rust Editor's
+        // private extension preserves high-density symbolic patterns without expanding
+        // billions of entries into an enormous JSON array.
         if !self.song.compressed_patterns.is_empty() {
             song_json["rustEditorCompressedPatterns"] = json!(self.song.compressed_patterns.iter().map(|p| json!({
                 "sectionIndex": p.section_index, "startMs": p.start_ms, "rowStepMs": p.row_step_ms,
-                "rows": p.rows, "density": p.density, "laneFrom": p.lane_from, "laneTo": p.lane_to
+                "rows": p.rows, "density": p.density, "strengthRows": p.strength_rows,
+                "noteCountPerLane": p.note_count_per_lane,
+                "laneFrom": p.lane_from, "laneTo": p.lane_to
             })).collect::<Vec<Value>>());
         }
         let root = json!({ "song": song_json });
@@ -591,7 +650,7 @@ impl ChartEditor {
     }
     fn save_binary(&self, path: &Path) -> Result<(), String> {
         if !self.song.compressed_patterns.is_empty() {
-            return Err("This BIN format cannot preserve legacy compressed spam metadata. New spam operations create individual note objects; remove or regenerate legacy patterns before BIN export.".into());
+            return Err("BIN export cannot preserve compressed high-density patterns. Save as JSON to retain these patterns with Rust Editor's JSON extension, or reduce the density enough to materialize individual notes.".into());
         }
         let tmp = path.with_extension(format!("{}.saving", path.extension().unwrap_or_default().to_string_lossy()));
         let mut out = File::create(&tmp).map_err(|e| e.to_string())?;
@@ -619,7 +678,7 @@ impl ChartEditor {
             let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             let loaded = if ext == "bin" { load_binary(&path) } else { load_json(&path) };
             match loaded {
-                Ok(song) => { self.song = song; self.undo_stack.clear(); self.redo_stack.clear(); self.current_section = 0; self.selected_note = None; self.position_steps = 0.0; self.scroll_row_offset = 0.0; self.camera_x_offset = 0.0; self.sustain_ms = 0.0; self.set_status(format!("Loaded {} ({} sections, {} notes).", path.display(), self.song.notes.len(), self.total_notes())); }
+                Ok(song) => { self.song = song; self.undo_stack.clear(); self.redo_stack.clear(); self.current_section = 0; self.selected_note = None; self.position_steps = 0.0; self.scroll_row_offset = 0.0; self.camera_x_offset = 0.0; self.sustain_ms = 0.0; self.set_status(format!("Loaded {} ({} sections, {} notes).", path.display(), format_count_with_commas(&self.song.notes.len().to_string()), self.total_notes())); }
                 Err(e) => self.set_status(format!("Load failed: {e}")),
             }
         }
@@ -779,108 +838,113 @@ impl ChartEditor {
         let step_ms = self.display_step_ms().max(0.0001);
         let alpha = (self.note_opacity * 255.0).clamp(0.0, 255.0) as u8;
 
-        // Compressed spam is drawn with the same original arrow sprites as regular
-        // notes. Never paint a blue placeholder block: only render the note images
-        // that can be seen in the viewport. Astronomical densities are sampled into
-        // a handful of sprite layers per lane/row so 10^308 counts stay inexpensive.
-        const MAX_COMPRESSED_SPRITE_SAMPLES: usize = 4;
-        let visible_rows = grid_rect.height() / row_h.max(1.0);
-        for pattern in self.song.compressed_patterns.iter().filter(|p| p.section_index == self.current_section) {
-            if pattern.lane_from >= lane_count || pattern.lane_to >= lane_count || pattern.rows == 0 {
-                continue;
-            }
-            let pattern_start_row = (pattern.start_ms / step_ms) as f32;
-            let row_stride = (pattern.row_step_ms / step_ms) as f32;
-            if !row_stride.is_finite() || row_stride <= 0.0 {
-                continue;
-            }
+        // Fully transparent means no note work at all. Setting the image tint alpha
+        // to zero still creates egui shapes and walks the chart every frame, which can
+        // become expensive for very dense charts. Keep the grid, playhead and input active.
+        if alpha > 0 {
+            const MAX_COMPRESSED_SPRITE_SAMPLES: usize = 4;
+            let visible_rows = grid_rect.height() / row_h.max(1.0);
+            for pattern in self.song.compressed_patterns.iter().filter(|p| p.section_index == self.current_section) {
+                if pattern.lane_from >= lane_count || pattern.lane_to >= lane_count || pattern.rows == 0 {
+                    continue;
+                }
+                let pattern_start_row = (pattern.start_ms / step_ms) as f32;
+                let row_stride = (pattern.row_step_ms / step_ms) as f32;
+                if !row_stride.is_finite() || row_stride <= 0.0 {
+                    continue;
+                }
 
-            // Restrict work to rows that overlap the current viewport, with one-row
-            // padding for note sprites that partially overlap a clip boundary.
-            let first_visible = (((self.scroll_row_offset - pattern_start_row - 1.0) / row_stride)
-                .floor().max(0.0) as usize).min(pattern.rows);
-            let last_visible = (((self.scroll_row_offset + visible_rows + 1.0 - pattern_start_row) / row_stride)
-                .ceil().max(0.0) as usize).min(pattern.rows);
-            if first_visible >= last_visible { continue; }
+                // Restrict work to rows that overlap the current viewport, with one-row
+                // padding for note sprites that partially overlap a clip boundary.
+                let first_visible = (((self.scroll_row_offset - pattern_start_row - 1.0) / row_stride)
+                    .floor().max(0.0) as usize).min(pattern.rows);
+                let last_visible = (((self.scroll_row_offset + visible_rows + 1.0 - pattern_start_row) / row_stride)
+                    .ceil().max(0.0) as usize).min(pattern.rows);
+                if first_visible >= last_visible { continue; }
 
-            let density = pattern.density.parse::<usize>().unwrap_or(usize::MAX);
-            let sample_count = density.max(1).min(MAX_COMPRESSED_SPRITE_SAMPLES);
-            for lane in pattern.lane_from..=pattern.lane_to {
-                let x = grid_left + lane as f32 * lane_w - self.camera_x_offset;
-                // Skip offscreen lanes before creating any image draw calls.
-                if x + lane_w < grid_rect.left() || x > grid_rect.right() { continue; }
-                let texture = if self.textures.len() >= 8 {
-                    Some(&self.textures[4 + (lane % 4)])
-                } else {
-                    None
-                };
-                for row_index in first_visible..last_visible {
-                    let display_row = pattern_start_row + row_index as f32 * row_stride;
-                    let base_y = grid_top + (display_row - self.scroll_row_offset) * row_h;
-                    for sample in 0..sample_count {
-                        // Evenly sample the represented density across the row. A very
-                        // large count still produces recognizable source note sprites.
-                        let fraction = sample as f32 / sample_count as f32;
-                        let note_rect = Rect::from_min_size(
-                            Pos2::new(x, base_y + fraction * row_h),
-                            Vec2::new(lane_w, row_h),
-                        );
-                        if note_rect.bottom() < grid_rect.top() || note_rect.top() > grid_rect.bottom() {
-                            continue;
-                        }
-                        if let Some(texture) = texture {
-                            clipped.image(
-                                texture.id(),
-                                note_rect,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::from_white_alpha(alpha),
+                let density = pattern.density.parse::<usize>().unwrap_or(usize::MAX);
+                let sample_count = density.max(1).min(MAX_COMPRESSED_SPRITE_SAMPLES);
+                for lane in pattern.lane_from..=pattern.lane_to {
+                    let x = grid_left + lane as f32 * lane_w - self.camera_x_offset;
+                    // Skip offscreen lanes before creating any image draw calls.
+                    if x + lane_w < grid_rect.left() || x > grid_rect.right() { continue; }
+                    let texture = if self.textures.len() >= 8 {
+                        Some(&self.textures[4 + (lane % 4)])
+                    } else {
+                        None
+                    };
+                    for row_index in first_visible..last_visible {
+                        let display_row = pattern_start_row + row_index as f32 * row_stride;
+                        let base_y = grid_top + (display_row - self.scroll_row_offset) * row_h;
+                        for sample in 0..sample_count {
+                            // Evenly sample the represented density across the row. A very
+                            // large count still produces recognizable source note sprites.
+                            let fraction = sample as f32 / sample_count as f32;
+                            if row_index as f64 + fraction as f64 >= pattern.strength_rows {
+                                continue;
+                            }
+                            let note_rect = Rect::from_min_size(
+                                Pos2::new(x, base_y + fraction * row_h),
+                                Vec2::new(lane_w, row_h),
                             );
-                        } else {
-                            // Fallback only if an embedded image failed to load; don't
-                            // reintroduce the old blue rectangle placeholder.
-                            clipped.rect_filled(
-                                note_rect.shrink(2.0),
-                                1.0,
-                                Color32::from_white_alpha(alpha),
-                            );
+                            if note_rect.bottom() < grid_rect.top() || note_rect.top() > grid_rect.bottom() {
+                                continue;
+                            }
+                            if let Some(texture) = texture {
+                                clipped.image(
+                                    texture.id(),
+                                    note_rect,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::from_white_alpha(alpha),
+                                );
+                            } else {
+                                // Fallback only if an embedded image failed to load; don't
+                                // reintroduce the old blue rectangle placeholder.
+                                clipped.rect_filled(
+                                    note_rect.shrink(2.0),
+                                    1.0,
+                                    Color32::from_white_alpha(alpha),
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
-        for (idx, note) in section_notes.iter().enumerate() {
-            if note.lane >= lane_count {
-                continue;
-            }
-            let display_row = (note.time_ms / step_ms) as f32;
-            let y = grid_top + (display_row - self.scroll_row_offset) * row_h;
-            let x = grid_left + note.lane as f32 * lane_w - self.camera_x_offset;
-            let note_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(lane_w, row_h));
-            if note_rect.bottom() < grid_rect.top() || note_rect.top() > grid_rect.bottom()
-                || note_rect.right() < grid_rect.left() || note_rect.left() > grid_rect.right() {
-                continue;
-            }
-            if note.sustain_ms > 0.0 {
-                let sustain_grids = note.sustain_ms / step_ms;
-                let tail_height = ((sustain_grids - 0.5).max(0.0) as f32 * row_h).max(0.0);
-                let body_width = (lane_w / 3.0).max(1.0);
-                let tail = Rect::from_min_size(
-                    Pos2::new(x + body_width, y + row_h * 0.5),
-                    Vec2::new(body_width, tail_height),
-                );
-                clipped.rect_filled(tail, 0.0, Color32::from_rgba_unmultiplied(0, 255, 0, 150));
-            }
-            if self.textures.len() >= 8 {
-                let arrow_tex = &self.textures[4 + (note.lane % 4)];
-                let tint = if Some(idx) == self.selected_note {
-                    Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
+            for (idx, note) in section_notes.iter().enumerate() {
+                if note.lane >= lane_count {
+                    continue;
+                }
+                let display_row = (note.time_ms / step_ms) as f32;
+                let y = grid_top + (display_row - self.scroll_row_offset) * row_h;
+                let x = grid_left + note.lane as f32 * lane_w - self.camera_x_offset;
+                let note_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(lane_w, row_h));
+                if note_rect.bottom() < grid_rect.top() || note_rect.top() > grid_rect.bottom()
+                    || note_rect.right() < grid_rect.left() || note_rect.left() > grid_rect.right() {
+                    continue;
+                }
+                if note.sustain_ms > 0.0 {
+                    let sustain_grids = note.sustain_ms / step_ms;
+                    let tail_height = ((sustain_grids - 0.5).max(0.0) as f32 * row_h).max(0.0);
+                    let body_width = (lane_w / 3.0).max(1.0);
+                    let tail = Rect::from_min_size(
+                        Pos2::new(x + body_width, y + row_h * 0.5),
+                        Vec2::new(body_width, tail_height),
+                    );
+                    clipped.rect_filled(tail, 0.0, Color32::from_rgba_unmultiplied(0, 255, 0, 150));
+                }
+                if self.textures.len() >= 8 {
+                    let arrow_tex = &self.textures[4 + (note.lane % 4)];
+                    let tint = if Some(idx) == self.selected_note {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
+                    } else {
+                        Color32::from_white_alpha(alpha)
+                    };
+                    clipped.image(arrow_tex.id(), note_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
                 } else {
-                    Color32::from_white_alpha(alpha)
-                };
-                clipped.image(arrow_tex.id(), note_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
-            } else {
-                clipped.rect_filled(note_rect, 0.0, Color32::from_white_alpha(alpha));
+                    clipped.rect_filled(note_rect, 0.0, Color32::from_white_alpha(alpha));
+                }
             }
+
         }
 
         if self.is_playing {
@@ -906,7 +970,9 @@ impl ChartEditor {
             if let Some(pos) = response.interact_pointer_pos() {
                 if grid_rect.contains(pos) {
                     let lane = ((pos.x - grid_left + self.camera_x_offset) / lane_w).floor().max(0.0) as usize;
-                    let row = ((pos.y - grid_top) / row_h + self.scroll_row_offset).floor().max(0.0) as f64;
+                    // Keep fractional row precision for hit-testing off-grid notes.
+                    // click_grid itself still snaps newly placed notes to whole rows.
+                    let row = ((pos.y - grid_top) / row_h + self.scroll_row_offset).max(0.0) as f64;
                     if lane < lane_count {
                         self.click_grid(lane, row, response.secondary_clicked());
                     }
@@ -981,16 +1047,30 @@ impl ChartEditor {
                 ui.add_enabled(false, egui::TextEdit::singleline(&mut strum_time));
                 egui::ComboBox::from_label("Note Type").selected_text(&self.note_type).show_ui(ui, |ui| { for s in ["Default", "Alt Animation", "Mine", "Hurt Note"] { ui.selectable_value(&mut self.note_type, s.to_string(), s); } });
                 ui.horizontal(|ui| { if ui.button("Copy Notes").clicked() { self.copy_selected_note(); } if ui.button("Paste Notes").clicked() { self.paste_selected_note(); } });
-                if let Some(i) = self.selected_note { ui.label(format!("Selected note: {}", i + 1)); } else { ui.label("No note selected."); }
+                if let Some(i) = self.selected_note { ui.label(format!("Selected note: {}", format_count_with_commas(&(i + 1).to_string()))); } else { ui.label("No note selected."); }
                 ui.label("E: make / extend long note; P: extend by one grid row.");
             }
             "Spamming" => {
-                ui.label("Spam Density (actual note count per grid row):");
+                ui.label("Spam Density (note count per grid row; very large counts use compact storage):");
                 ui.horizontal(|ui| {
                     ui.label("Density");
-                    ui.add(egui::TextEdit::singleline(&mut self.spam_density_text).desired_width(220.0).font(egui::TextStyle::Monospace));
+                    let density_response = ui.add(egui::TextEdit::singleline(&mut self.spam_density_text).desired_width(220.0).font(egui::TextStyle::Monospace));
+                    // Reformat after editing ends so the text cursor does not jump
+                    // after every typed digit. Commas are accepted by the parser.
+                    if density_response.lost_focus() {
+                        if let Ok(normalized) = normalize_count_input(&self.spam_density_text) {
+                            // Keep ordinary inputs easy to read. Avoid expanding astronomical
+                            // values into enormous editable strings that would slow the UI.
+                            if normalized.len() <= 120 {
+                                self.spam_density_text = format_count_with_commas(&normalized);
+                            }
+                        }
+                    }
+                    if let Ok(normalized) = normalize_count_input(&self.spam_density_text) {
+                        ui.label(RichText::new(format!("→ {}", format_count_for_display(&normalized))).monospace().weak());
+                    }
                 });
-                ui.small("Density creates actual note objects, not a compressed pattern. Maximum: 1,000,000 notes per spam action; larger requests are rejected without changing the chart.");
+                ui.small("No 1,000,000-note action cap. Small requests create individually editable notes; very large finite counts are represented by compact patterns to avoid exhausting memory. Save as JSON to preserve compact patterns in Rust Editor.");
                 ui.label("Spam Strength (grid rows to fill):"); ui.add(egui::DragValue::new(&mut self.spam_strength).speed(0.25).range(0.03125..=4096.0));
                 ui.label("Lane range for spam:");
                 ui.horizontal(|ui| { ui.label("From"); ui.add(egui::DragValue::new(&mut self.spam_lane_from).range(0..=self.song.mania.saturating_sub(1))); ui.label("To"); ui.add(egui::DragValue::new(&mut self.spam_lane_to).range(0..=self.song.mania.saturating_sub(1))); });
@@ -1115,19 +1195,29 @@ impl eframe::App for ChartEditor {
             .min_height(145.0)
             .frame(egui::Frame::new().fill(Color32::from_rgb(39, 42, 46)).inner_margin(egui::Margin::same(5)))
             .show(ctx, |ui| {
-                let lane_half = self.song.mania / 2;
-                let mut opponent = 0usize;
-                let mut player = 0usize;
-                for sec in &self.song.notes {
-                    for n in &sec.notes {
-                        if n.lane < lane_half { opponent += 1; } else { player += 1; }
+                // These lane statistics scan every materialized note, so do not run
+                // that O(note-count) work on every frame while notes are intentionally
+                // invisible. Length/total count remain cheap to read and useful here.
+                let status_text = if ((self.note_opacity * 255.0).clamp(0.0, 255.0) as u8) == 0 {
+                    format!(
+                        "E - Make Selected Note Long; press again to extend by 1 grid\nCtrl/Cmd+Z - Undo     Ctrl/Cmd+Y or Cmd+Shift+Z - Redo\nZ/X - Zoom Grid Out / In\nW/S - Move 1 Step     A/D - Prev/Next Section\nMouse Wheel - Scroll Through Grid\nLeft Click - Place Note     Right Click - Delete Note\n\nNote rendering: OFF (alpha is 0)\nTotal Notes: {}\nLane counts: skipped while notes are invisible",
+                        self.total_notes()
+                    )
+                } else {
+                    let lane_half = self.song.mania / 2;
+                    let mut opponent = 0usize;
+                    let mut player = 0usize;
+                    for sec in &self.song.notes {
+                        for n in &sec.notes {
+                            if n.lane < lane_half { opponent += 1; } else { player += 1; }
+                        }
                     }
-                }
-                let rendered = self.song.notes[self.current_section].notes.iter().filter(|n| n.lane < self.song.mania).count();
-                let status_text = format!(
-                    "E - Make Selected Note Long; press again to extend by 1 grid\nCtrl/Cmd+Z - Undo     Ctrl/Cmd+Y or Cmd+Shift+Z - Redo\nZ/X - Zoom Grid Out / In\nW/S - Move 1 Step     A/D - Prev/Next Section\nMouse Wheel - Scroll Through Grid\nLeft Click - Place Note     Right Click - Delete Note\n\nOpponent: {}\nPlayer: {}\nTotal Notes: {}\nRendered Notes: {}",
-                    opponent, player, self.total_notes(), rendered
-                );
+                    let rendered = self.song.notes[self.current_section].notes.iter().filter(|n| n.lane < self.song.mania).count();
+                    format!(
+                        "E - Make Selected Note Long; press again to extend by 1 grid\nCtrl/Cmd+Z - Undo     Ctrl/Cmd+Y or Cmd+Shift+Z - Redo\nZ/X - Zoom Grid Out / In\nW/S - Move 1 Step     A/D - Prev/Next Section\nMouse Wheel - Scroll Through Grid\nLeft Click - Place Note     Right Click - Delete Note\n\nOpponent: {}\nPlayer: {}\nTotal Notes: {}\nRendered Notes: {}",
+                        format_count_with_commas(&opponent.to_string()), format_count_with_commas(&player.to_string()), self.total_notes(), format_count_with_commas(&rendered.to_string())
+                    )
+                };
                 ui.label(RichText::new(status_text).monospace().size(12.0).color(Color32::WHITE));
             });
 
@@ -1180,7 +1270,7 @@ impl eframe::App for ChartEditor {
                             self.song.compressed_patterns.retain(|p| {
                                 let section_start = section_starts.get(p.section_index).copied().unwrap_or(0.0);
                                 let start = section_start + p.start_ms;
-                                let end = start + p.row_step_ms * p.rows as f64;
+                                let end = start + (p.end_ms() - p.start_ms);
                                 end >= threshold
                             });
                         } else {
@@ -1205,7 +1295,7 @@ impl eframe::App for ChartEditor {
                             }
                             self.song.compressed_patterns = kept;
                         }
-                        self.selected_note = None; self.show_remove_dialog = false; self.set_status(format!("Removed {removed} notes."));
+                        self.selected_note = None; self.show_remove_dialog = false; self.set_status(format!("Removed {} notes.", format_count_with_commas(&removed.to_string())));
                     }
                     if ui.button("Cancel").clicked() { self.show_remove_dialog = false; }
                 });
@@ -1215,7 +1305,7 @@ impl eframe::App for ChartEditor {
 }
 
 /// Normalize a count entered as an integer, scientific notation (1e308), or
-/// power notation (10^308 / 10³⁰⁸). The result is an exact decimal integer.
+/// power notation (for example, 10^308 / 10³⁰⁸). The result is an exact decimal integer.
 fn normalize_count_input(input: &str) -> Result<String, String> {
     let compact: String = input.chars()
         .filter(|c| !c.is_whitespace() && *c != ',' && *c != '_')
@@ -1230,13 +1320,15 @@ fn normalize_count_input(input: &str) -> Result<String, String> {
     if let Some((base, exponent)) = alias.split_once('^') {
         if base != "10" { return Err("Power notation must look like 10^308.".into()); }
         let exponent: usize = exponent.parse().map_err(|_| "Invalid power exponent.".to_string())?;
-        if exponent > MAX_DENSITY_DECIMAL_EXPONENT { return Err("Density exceeds the supported input maximum of 10^308; this does not mean that many individual notes can be allocated.".into()); }
+        if exponent > MAX_DENSITY_DECIMAL_EXPONENT { return Err(format!("Density input is limited to 10^{MAX_DENSITY_DECIMAL_EXPONENT} to protect memory; chart actions are not capped at one million notes.")); }
         return Ok(format!("1{}", "0".repeat(exponent)));
     }
 
     let (mantissa, exponent) = if let Some(pos) = alias.find(|c| c == 'e' || c == 'E') {
         let exp: i32 = alias[pos + 1..].parse().map_err(|_| "Invalid scientific-notation exponent.".to_string())?;
-        if exp < -10_000 || exp > 10_000 { return Err("Scientific-notation exponent is outside the accepted range.".into()); }
+        if exp < -(MAX_DENSITY_DECIMAL_EXPONENT as i32) || exp > MAX_DENSITY_DECIMAL_EXPONENT as i32 {
+            return Err(format!("Scientific-notation exponent is outside the accepted ±{} range.", MAX_DENSITY_DECIMAL_EXPONENT));
+        }
         (&alias[..pos], exp)
     } else { (alias.as_str(), 0) };
 
@@ -1264,17 +1356,32 @@ fn normalize_count_input(input: &str) -> Result<String, String> {
     } else if decimal_position > digits.len() {
         let zero_count = decimal_position - digits.len();
         if digits.len() + zero_count > MAX_DENSITY_DECIMAL_EXPONENT + 1 {
-            return Err("Density exceeds the supported input maximum of 10^308; this does not mean that many individual notes can be allocated.".into());
+            return Err(format!("Density input is limited to 10^{MAX_DENSITY_DECIMAL_EXPONENT} to protect memory; chart actions are not capped at one million notes."));
         }
         digits.push_str(&"0".repeat(zero_count));
     }
     let normalized = digits.trim_start_matches('0').to_string();
     if normalized.is_empty() || normalized == "0" { return Err("Density must be at least 1.".into()); }
-    let max = format!("1{}", "0".repeat(MAX_DENSITY_DECIMAL_EXPONENT));
-    if normalized.len() > max.len() || (normalized.len() == max.len() && normalized.as_str() > max.as_str()) {
-        return Err("Density exceeds the supported input maximum of 10^308; this does not mean that many individual notes can be allocated.".into());
+    // The largest accepted input is exactly 10^MAX_DENSITY_DECIMAL_EXPONENT.
+    // Avoid building another 100k-character boundary string for every normal parse.
+    if normalized.len() > MAX_DENSITY_DECIMAL_EXPONENT + 1
+        || (normalized.len() == MAX_DENSITY_DECIMAL_EXPONENT + 1
+            && (normalized.as_bytes()[0] != b'1'
+                || normalized.as_bytes()[1..].iter().any(|byte| *byte != b'0'))) {
+        return Err(format!("Density input is limited to 10^{MAX_DENSITY_DECIMAL_EXPONENT} to protect memory; chart actions are not capped at one million notes."));
     }
     Ok(normalized)
+}
+
+fn normalize_positive_decimal_integer(input: &str) -> Option<String> {
+    // This value is generated by Rust Editor and may be slightly larger than the
+    // supported density input (for example, density × strength). Bound text length
+    // so malformed project files cannot force unbounded allocations while parsing.
+    if input.is_empty() || input.len() > MAX_DENSITY_DECIMAL_EXPONENT + 100 || !input.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let normalized = input.trim_start_matches('0');
+    if normalized.is_empty() { None } else { Some(normalized.to_string()) }
 }
 
 fn decimal_add(a: &str, b: &str) -> String {
@@ -1304,15 +1411,63 @@ fn decimal_mul_small(number: &str, multiplier: u64) -> String {
     out.into_iter().rev().collect()
 }
 
-fn compact_count(number: &str) -> String {
-    if number.len() <= 24 { return number.to_string(); }
-    let bytes = number.as_bytes();
+fn decimal_ceil_mul_f64(number: &str, factor: f64) -> String {
+    if number == "0" || factor <= 0.0 || !factor.is_finite() { return "0".into(); }
+    // Spam strength is a UI decimal. Convert it to a fixed 12-decimal rational so
+    // huge densities are multiplied without first overflowing or rounding to f64.
+    let mut factor_text = format!("{factor:.12}");
+    while factor_text.contains('.') && factor_text.ends_with('0') { factor_text.pop(); }
+    if factor_text.ends_with('.') { factor_text.pop(); }
+    let (whole, fraction) = factor_text.split_once('.').unwrap_or((&factor_text, ""));
+    let numerator_text = format!("{whole}{fraction}");
+    let numerator = numerator_text.parse::<u64>().unwrap_or(0);
+    if numerator == 0 { return "0".into(); }
+    let product = decimal_mul_small(number, numerator);
+    let scale = fraction.len();
+    if scale == 0 { return product; }
+    if product.len() <= scale {
+        let padded = format!("{:0>width$}", product, width = scale + 1);
+        let split = padded.len() - scale;
+        let whole = &padded[..split];
+        let remainder = &padded[split..];
+        if remainder.bytes().any(|b| b != b'0') { decimal_add(whole, "1") } else { whole.to_string() }
+    } else {
+        let split = product.len() - scale;
+        let whole = &product[..split];
+        let remainder = &product[split..];
+        if remainder.bytes().any(|b| b != b'0') { decimal_add(whole, "1") } else { whole.to_string() }
+    }
+}
+
+fn format_count_with_commas(number: &str) -> String {
+    // Counts are stored as exact decimal strings, so group them without parsing
+    // into usize/u128 (which would overflow for extremely large chart densities).
+    if number.len() <= 3 { return number.to_string(); }
+    let first_group_len = match number.len() % 3 { 0 => 3, n => n };
+    let mut formatted = String::with_capacity(number.len() + (number.len() - 1) / 3);
+    formatted.push_str(&number[..first_group_len]);
+    for group in number.as_bytes()[first_group_len..].chunks(3) {
+        formatted.push(',');
+        // Count strings are normalized to ASCII digits before reaching this helper.
+        formatted.push_str(std::str::from_utf8(group).expect("count strings contain ASCII digits"));
+    }
+    formatted
+}
+
+fn format_count_for_display(number: &str) -> String {
+    // Full grouping is helpful for normal counts, but a 100,000-digit chart count
+    // would itself make the UI sluggish. Keep astronomical counts compact.
+    const MAX_FULL_DISPLAY_DIGITS: usize = 120;
+    if number.len() <= MAX_FULL_DISPLAY_DIGITS {
+        return format_count_with_commas(number);
+    }
+    let first = number.as_bytes()[0] as char;
+    let tail = number.as_bytes().iter().skip(1).take(3)
+        .map(|byte| *byte as char).collect::<String>()
+        .trim_end_matches('0').to_string();
     let exponent = number.len() - 1;
-    let significant = bytes.iter().skip_while(|b| **b == b'0').copied().collect::<Vec<_>>();
-    if significant.is_empty() { return "0".into(); }
-    let first = significant[0] as char;
-    let tail = significant.iter().skip(1).take(3).map(|b| *b as char).collect::<String>().trim_end_matches('0').to_string();
-    if tail.is_empty() { format!("{first}e{exponent}") } else { format!("{first}.{tail}e{exponent}") }
+    if tail.is_empty() { format!("{first}e{exponent}") }
+    else { format!("{first}.{tail}e{exponent}") }
 }
 
 fn load_textures(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
@@ -1406,14 +1561,21 @@ fn parse_chart_json(text: &str) -> Result<SongData, String> {
             let lane_to = item.get("laneTo").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
             let density_input = item.get("density").and_then(Value::as_str).unwrap_or("");
             let density = match normalize_count_input(density_input) { Ok(value) => value, Err(_) => continue };
+            let strength_rows = item.get("strengthRows").and_then(Value::as_f64).unwrap_or(rows as f64);
+            let note_count_per_lane = item.get("noteCountPerLane").and_then(Value::as_str)
+                .and_then(normalize_positive_decimal_integer)
+                .unwrap_or_else(|| decimal_mul_small(&density, rows as u64));
             if section_index >= song.notes.len() || !start_ms.is_finite() || start_ms < 0.0
                 || !row_step_ms.is_finite() || row_step_ms <= 0.0
                 || rows == 0 || rows > MAX_COMPRESSED_PATTERN_ROWS
+                || !strength_rows.is_finite() || strength_rows <= 0.0
+                || strength_rows > rows as f64 || strength_rows.ceil() as usize != rows
                 || lane_from > lane_to || lane_to >= song.mania {
                 continue;
             }
             song.compressed_patterns.push(CompressedSpamPattern {
-                section_index, start_ms, row_step_ms, rows, density, lane_from, lane_to,
+                section_index, start_ms, row_step_ms, rows, density, strength_rows,
+                note_count_per_lane, lane_from, lane_to,
             });
         }
     }
@@ -1453,26 +1615,74 @@ fn load_binary(path: &Path) -> Result<SongData, String> {
 
 #[cfg(test)]
 mod huge_count_tests {
-    use super::{decimal_add, decimal_mul_small, normalize_count_input};
+    use super::{decimal_add, decimal_ceil_mul_f64, decimal_mul_small, format_count_for_display, format_count_with_commas, normalize_count_input};
 
     #[test]
-    fn supports_ten_to_the_308_exactly() {
+    fn count_display_uses_thousands_separators_for_small_and_huge_values() {
+        assert_eq!(normalize_count_input("1,000,000").unwrap(), "1000000");
+        assert_eq!(format_count_with_commas("0"), "0");
+        assert_eq!(format_count_with_commas("999"), "999");
+        assert_eq!(format_count_with_commas("1000"), "1,000");
+        assert_eq!(format_count_with_commas("1000000"), "1,000,000");
+        assert_eq!(format_count_with_commas("1234567890"), "1,234,567,890");
+        let huge = format_count_with_commas(&format!("1{}", "0".repeat(30)));
+        assert_eq!(huge, "1,000,000,000,000,000,000,000,000,000,000");
+        assert!(!huge.contains('e'));
+        assert_eq!(format_count_for_display(&format!("1{}", "0".repeat(10_000))), "1e10000");
+    }
+
+    #[test]
+    fn supports_densities_far_beyond_machine_integer_ranges() {
         let count = normalize_count_input("1e308").unwrap();
         assert_eq!(count.len(), 309);
         assert_eq!(count, normalize_count_input("10^308").unwrap());
         assert_eq!(count, normalize_count_input("10³⁰⁸").unwrap());
+        let much_larger = normalize_count_input("1e10000").unwrap();
+        assert_eq!(much_larger.len(), 10_001);
+        assert_eq!(much_larger, normalize_count_input("10^10000").unwrap());
     }
 
     #[test]
-    fn rejects_values_above_ten_to_the_308() {
-        assert!(normalize_count_input("1.1e308").is_err());
-        assert!(normalize_count_input("1e309").is_err());
+    fn rejects_only_values_beyond_the_decimal_input_safety_bound() {
+        assert!(normalize_count_input("1e100001").is_err());
+        assert!(normalize_count_input("10^100001").is_err());
+        assert!(normalize_count_input("1.1e100000").is_err());
     }
 
     #[test]
     fn exact_decimal_math_works_for_huge_counts() {
         assert_eq!(decimal_mul_small("100000000000000000000", 64), "6400000000000000000000");
         assert_eq!(decimal_add("99999999999999999999", "1"), "100000000000000000000");
+    }
+
+    #[test]
+    fn large_spam_counts_are_counted_without_f64_overflow() {
+        assert_eq!(decimal_ceil_mul_f64("100000000000000000000", 1.25), "125000000000000000000");
+        assert_eq!(decimal_ceil_mul_f64("100000000000000000000", 0.03125), "3125000000000000000");
+        assert_eq!(decimal_ceil_mul_f64("100000000000000000001", 0.5), "50000000000000000001");
+        assert_eq!(decimal_ceil_mul_f64("1", 4096.0), "4096");
+        assert_eq!(decimal_ceil_mul_f64(&format!("1{}", "0".repeat(308)), 4096.0), format!("4096{}", "0".repeat(308)));
+    }
+}
+
+#[cfg(test)]
+mod note_hit_tests {
+    use super::{note_hit_distance, Note};
+
+    #[test]
+    fn detects_notes_that_are_not_aligned_to_grid_rows() {
+        let note = Note { time_ms: 4.35 * 100.0, lane: 2, sustain_ms: 0.0 };
+        // The note head spans rows 4.35 through 5.35, not just row 4.
+        assert!(note_hit_distance(&note, 2, 5.0, 100.0).is_some());
+        assert!(note_hit_distance(&note, 2, 4.1, 100.0).is_none());
+        assert!(note_hit_distance(&note, 1, 5.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn sustain_tail_is_also_a_deletion_hit_area() {
+        let note = Note { time_ms: 4.25 * 100.0, lane: 3, sustain_ms: 250.0 };
+        assert!(note_hit_distance(&note, 3, 6.5, 100.0).is_some());
+        assert!(note_hit_distance(&note, 3, 7.0, 100.0).is_none());
     }
 }
 
