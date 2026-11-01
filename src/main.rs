@@ -2,8 +2,9 @@ use eframe::egui::{self, Align, Color32, FontId, Key, Layout, Pos2, Rect, RichTe
 use rfd::FileDialog;
 use rodio::{Decoder, OutputStream, Sink};
 use serde_json::{json, Value};
+use std::convert::TryFrom;
 use std::fs::{self, File};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -142,6 +143,7 @@ struct ChartEditor {
     remove_lane_from: usize,
     remove_lane_to: usize,
     remove_before_ms: f64,
+    remove_note_count_input: String,
     textures: Vec<egui::TextureHandle>,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
@@ -224,7 +226,7 @@ impl ChartEditor {
             song_credit: "Test".into(), credit_icon: "bf".into(), disable_note_rgb: false,
             event_type: "---".into(), event_value1: String::new(), event_value2: String::new(), events: Vec::new(),
             audio_stream: None, audio_sink: None, audio_error: String::new(),
-            show_remove_dialog: false, remove_mode: 0, remove_lane_from: 0, remove_lane_to: 7, remove_before_ms: 0.0,
+            show_remove_dialog: false, remove_mode: 0, remove_lane_from: 0, remove_lane_to: 7, remove_before_ms: 0.0, remove_note_count_input: "1".into(),
             undo_stack: Vec::new(), redo_stack: Vec::new(),
         }
     }
@@ -307,6 +309,107 @@ impl ChartEditor {
         format_count_for_display(&total)
     }
     fn selected_note(&self) -> Option<&Note> { self.selected_note.and_then(|i| self.song.notes.get(self.current_section)?.notes.get(i)) }
+
+    /// Remove an exact number of notes, starting with the most recently stored
+    /// materialized notes and then the newest symbolic patterns. Symbolic patterns
+    /// are trimmed by lane without expanding their represented events.
+    fn remove_exact_note_count(&mut self, requested: &str) -> Result<String, String> {
+        let mut remaining = normalize_count_input(requested)
+            .map_err(|_| "Enter a valid positive number of notes to remove.".to_string())?;
+        let requested = remaining.clone();
+
+        // Remove materialized notes from the end of the chart first.
+        for section in self.song.notes.iter_mut().rev() {
+            if remaining == "0" { break; }
+            let available = section.notes.len().to_string();
+            if available == "0" { continue; }
+            if decimal_cmp(&remaining, &available).is_ge() {
+                section.notes.clear();
+                remaining = decimal_subtract(&remaining, &available);
+            } else {
+                // remaining is now guaranteed to fit usize because it is less
+                // than this section's Vec length.
+                let count = remaining.parse::<usize>()
+                    .map_err(|_| "Could not interpret the requested note count.".to_string())?;
+                for _ in 0..count { section.notes.pop(); }
+                remaining = "0".into();
+            }
+        }
+
+        // Then trim symbolic patterns newest-first. Each pattern has the same
+        // exact count on every lane. Complete lanes are removed first; if the
+        // requested count ends partway through a lane, keep that lane as a
+        // single-lane pattern with an exact reduced note_count_per_lane.
+        let mut kept_reversed = Vec::with_capacity(self.song.compressed_patterns.len());
+        for pattern in self.song.compressed_patterns.drain(..).rev() {
+            if remaining == "0" {
+                kept_reversed.push(pattern);
+                continue;
+            }
+
+            let lane_count = pattern.lane_to.saturating_sub(pattern.lane_from).saturating_add(1);
+            if lane_count == 0 {
+                continue;
+            }
+            let per_lane = pattern.note_count_per_lane.clone();
+            let total = decimal_mul_small(&per_lane, lane_count as u64);
+            if decimal_cmp(&remaining, &total).is_ge() {
+                remaining = decimal_subtract(&remaining, &total);
+                continue;
+            }
+
+            let mut amount_left = remaining.clone();
+            let mut fully_removed_lanes = 0usize;
+            while fully_removed_lanes < lane_count && decimal_cmp(&amount_left, &per_lane).is_ge() {
+                amount_left = decimal_subtract(&amount_left, &per_lane);
+                fully_removed_lanes += 1;
+            }
+
+            // `amount_left` is the portion removed from the next lane, if any.
+            let partial_lane = pattern.lane_to.saturating_sub(fully_removed_lanes);
+            if amount_left != "0" {
+                let partial_remaining = decimal_subtract(&per_lane, &amount_left);
+                if partial_remaining != "0" {
+                    let mut partial = pattern.clone();
+                    partial.lane_from = partial_lane;
+                    partial.lane_to = partial_lane;
+                    partial.note_count_per_lane = partial_remaining.clone();
+                    // Preserve the pattern's original timing span as much as possible,
+                    // but shorten its tail to match the remaining symbolic event count.
+                    // The count itself remains exact in note_count_per_lane; this ratio
+                    // only controls the editor's intentionally sampled visualization.
+                    let remaining_rows = decimal_ratio_to_f64(&partial_remaining, &partial.density)
+                        .min(partial.strength_rows)
+                        .max(f64::MIN_POSITIVE);
+                    partial.strength_rows = remaining_rows;
+                    partial.rows = remaining_rows.ceil().max(1.0) as usize;
+                    kept_reversed.push(partial);
+                }
+            }
+
+            // Lanes below the partially removed lane retain their full count.
+            // When `amount_left` is zero, the next lane is untouched too, so
+            // retain it as the highest lane in the remaining full-lane range.
+            if amount_left == "0" {
+                let mut full_lanes = pattern;
+                full_lanes.lane_to = full_lanes.lane_to.saturating_sub(fully_removed_lanes);
+                if full_lanes.lane_from <= full_lanes.lane_to {
+                    kept_reversed.push(full_lanes);
+                }
+            } else if partial_lane > pattern.lane_from {
+                let mut full_lanes = pattern;
+                full_lanes.lane_to = partial_lane - 1;
+                if full_lanes.lane_from <= full_lanes.lane_to {
+                    kept_reversed.push(full_lanes);
+                }
+            }
+            remaining = "0".into();
+        }
+        self.song.compressed_patterns = kept_reversed.into_iter().rev().collect();
+
+        let removed = decimal_subtract(&requested, &remaining);
+        Ok(removed)
+    }
 
     fn set_status(&mut self, s: impl Into<String>) { self.status = s.into(); }
     fn set_mania_keys_per_side(&mut self, keys: usize) {
@@ -608,12 +711,54 @@ impl ChartEditor {
         self.set_status(if self.is_playing { "Playback started." } else { "Playback paused." });
     }
 
+    fn save_compressed_binary_dialog(&mut self) {
+        let default_name = format!("{}.bin.zst", safe_filename(&self.song.song));
+        if let Some(chosen) = FileDialog::new()
+            .set_title("Export Compressed Binary Chart (.bin.zst)")
+            .add_filter("Compressed Binary (.bin.zst)", &["zst"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            let lower_name = chosen.file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            let target = if lower_name.ends_with(".bin.zst") {
+                chosen
+            } else {
+                let name = chosen.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| "chart".into());
+                let base = name.strip_suffix(".zst").unwrap_or(name.as_str());
+                let base = base.strip_suffix(".bin").unwrap_or(base);
+                chosen.with_file_name(format!("{base}.bin.zst"))
+            };
+            match self.save_compressed_binary(&target) {
+                Ok(()) => self.set_status(format!("Saved compressed chart to {} ({} notes).", target.display(), self.total_notes())),
+                Err(e) => self.set_status(format!("Compressed BIN save failed: {e}")),
+            }
+        }
+    }
+
     fn save_chart_dialog(&mut self) {
-        let chosen = FileDialog::new().set_title("Save FNF Chart").add_filter("FNF Chart JSON", &["json"]).add_filter("FNF Editor Binary", &["bin"]).set_file_name(&format!("{}.json", safe_filename(&self.song.song))).save_file();
+        let chosen = FileDialog::new()
+            .set_title("Save FNF Chart")
+            .add_filter("FNF Chart JSON (.json)", &["json"])
+            .add_filter("FNF Editor Binary (.bin)", &["bin"])
+            .add_filter("Compressed Binary (.bin.zst)", &["zst"])
+            .set_file_name(&format!("{}.json", safe_filename(&self.song.song)))
+            .save_file();
         if let Some(path) = chosen {
-            let binary = path.extension().map(|e| e.to_string_lossy().eq_ignore_ascii_case("bin")).unwrap_or(false);
-            let result = if binary { self.save_binary(&path) } else { self.save_json(&path) };
-            match result { Ok(()) => self.set_status(format!("Saved chart to {} ({} notes).", path.display(), self.total_notes())), Err(e) => self.set_status(format!("Save failed: {e}")) }
+            let file_name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            let extension = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            let result = if file_name.ends_with(".bin.zst") || extension == "zst" {
+                self.save_compressed_binary(&path)
+            } else if extension == "bin" {
+                self.save_binary(&path)
+            } else {
+                self.save_json(&path)
+            };
+            match result {
+                Ok(()) => self.set_status(format!("Saved chart to {} ({} notes).", path.display(), self.total_notes())),
+                Err(e) => self.set_status(format!("Save failed: {e}")),
+            }
         }
     }
     fn save_json(&self, path: &Path) -> Result<(), String> {
@@ -648,9 +793,92 @@ impl ChartEditor {
         serde_json::to_writer_pretty(&mut file, &root).map_err(|e| e.to_string())?;
         file.write_all(b"\n").map_err(|e| e.to_string())
     }
+    /// Save the editor's extended binary format through a Zstandard stream.
+    /// Unlike the legacy BIN exporter, FNFEBIN4 also stores symbolic high-density
+    /// patterns, so billions of represented notes do not need to be expanded.
+    fn save_compressed_binary(&self, path: &Path) -> Result<(), String> {
+        const ZSTD_LEVEL: i32 = 6;
+        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "chart.bin.zst".into());
+        let tmp = path.with_file_name(format!("{file_name}.saving"));
+
+        let result = (|| {
+            let file = File::create(&tmp).map_err(|e| e.to_string())?;
+            let mut encoder = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)
+                .map_err(|e| format!("Could not start Zstandard compression: {e}"))?;
+            self.write_binary_v4(&mut encoder)?;
+            let output = encoder.finish().map_err(|e| format!("Could not finish Zstandard compression: {e}"))?;
+            output.sync_all().map_err(|e| e.to_string())?;
+            fs::rename(&tmp, path).map_err(|e| e.to_string())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    }
+
+    /// FNFEBIN4 is used inside the .bin.zst container. It stores section and
+    /// pattern counts explicitly, then preserves the editor's symbolic patterns.
+    fn write_binary_v4(&self, out: &mut impl Write) -> Result<(), String> {
+        write_bin_string(out, "FNFEBIN4")?;
+        write_bin_string(out, &self.song.song)?;
+        out.write_all(&self.safe_bpm().to_be_bytes()).map_err(|e| e.to_string())?;
+        out.write_all(&[u8::from(self.song.needs_voices)]).map_err(|e| e.to_string())?;
+        write_bin_string(out, &self.song.player1)?;
+        write_bin_string(out, &self.song.player2)?;
+        write_bin_string(out, &self.song.gf_version)?;
+        out.write_all(&self.song.speed.to_be_bytes()).map_err(|e| e.to_string())?;
+        out.write_all(&(self.song.mania.clamp(2, 64) as i32).to_be_bytes()).map_err(|e| e.to_string())?;
+
+        let section_count = i64::try_from(self.song.notes.len())
+            .map_err(|_| "Too many sections for FNFEBIN4".to_string())?;
+        out.write_all(&section_count.to_be_bytes()).map_err(|e| e.to_string())?;
+        let mut start_ms = 0.0;
+        for section in &self.song.notes {
+            let length = i32::try_from(section.length_in_steps.max(1))
+                .map_err(|_| "Section length is too large for FNFEBIN4".to_string())?;
+            let valid_count = section.notes.iter().filter(|n| n.lane < self.song.mania).count();
+            let note_count = i64::try_from(valid_count)
+                .map_err(|_| "Too many materialized notes in one section".to_string())?;
+
+            out.write_all(&length.to_be_bytes()).map_err(|e| e.to_string())?;
+            out.write_all(&[u8::from(section.must_hit_section)]).map_err(|e| e.to_string())?;
+            out.write_all(&note_count.to_be_bytes()).map_err(|e| e.to_string())?;
+            for note in section.notes.iter().filter(|n| n.lane < self.song.mania) {
+                out.write_all(&(start_ms + note.time_ms).to_be_bytes()).map_err(|e| e.to_string())?;
+                let lane = i32::try_from(note.lane).map_err(|_| "Note lane is too large".to_string())?;
+                out.write_all(&lane.to_be_bytes()).map_err(|e| e.to_string())?;
+                out.write_all(&note.sustain_ms.to_be_bytes()).map_err(|e| e.to_string())?;
+            }
+            start_ms += section.length_in_steps.max(1) as f64 * self.storage_step_ms();
+        }
+
+        let pattern_count = i64::try_from(self.song.compressed_patterns.len())
+            .map_err(|_| "Too many compressed patterns for FNFEBIN4".to_string())?;
+        out.write_all(&pattern_count.to_be_bytes()).map_err(|e| e.to_string())?;
+        for pattern in &self.song.compressed_patterns {
+            let section_index = i64::try_from(pattern.section_index)
+                .map_err(|_| "Pattern section index is too large".to_string())?;
+            let rows = i64::try_from(pattern.rows)
+                .map_err(|_| "Pattern row count is too large".to_string())?;
+            let lane_from = i32::try_from(pattern.lane_from).map_err(|_| "Pattern lane is too large".to_string())?;
+            let lane_to = i32::try_from(pattern.lane_to).map_err(|_| "Pattern lane is too large".to_string())?;
+            out.write_all(&section_index.to_be_bytes()).map_err(|e| e.to_string())?;
+            out.write_all(&pattern.start_ms.to_be_bytes()).map_err(|e| e.to_string())?;
+            out.write_all(&pattern.row_step_ms.to_be_bytes()).map_err(|e| e.to_string())?;
+            out.write_all(&rows.to_be_bytes()).map_err(|e| e.to_string())?;
+            write_bin_string(out, &pattern.density)?;
+            out.write_all(&pattern.strength_rows.to_be_bytes()).map_err(|e| e.to_string())?;
+            write_bin_string(out, &pattern.note_count_per_lane)?;
+            out.write_all(&lane_from.to_be_bytes()).map_err(|e| e.to_string())?;
+            out.write_all(&lane_to.to_be_bytes()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     fn save_binary(&self, path: &Path) -> Result<(), String> {
         if !self.song.compressed_patterns.is_empty() {
-            return Err("BIN export cannot preserve compressed high-density patterns. Save as JSON to retain these patterns with Rust Editor's JSON extension, or reduce the density enough to materialize individual notes.".into());
+            return Err("BIN export cannot preserve symbolic high-density patterns. Use JSON or the new .bin.zst format to retain them.".into());
         }
         let tmp = path.with_extension(format!("{}.saving", path.extension().unwrap_or_default().to_string_lossy()));
         let mut out = File::create(&tmp).map_err(|e| e.to_string())?;
@@ -674,9 +902,20 @@ impl ChartEditor {
     }
 
     fn load_chart_dialog(&mut self) {
-        if let Some(path) = FileDialog::new().set_title("Load FNF Chart (JSON / BIN)").add_filter("FNF Charts", &["json", "bin"]).pick_file() {
+        if let Some(path) = FileDialog::new()
+            .set_title("Load FNF Chart (JSON / BIN / BIN.ZST)")
+            .add_filter("FNF Charts", &["json", "bin", "zst"])
+            .pick_file()
+        {
+            let file_name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            let loaded = if ext == "bin" { load_binary(&path) } else { load_json(&path) };
+            let loaded = if file_name.ends_with(".bin.zst") || ext == "zst" {
+                load_compressed_binary(&path)
+            } else if ext == "bin" {
+                load_binary(&path)
+            } else {
+                load_json(&path)
+            };
             match loaded {
                 Ok(song) => { self.song = song; self.undo_stack.clear(); self.redo_stack.clear(); self.current_section = 0; self.selected_note = None; self.position_steps = 0.0; self.scroll_row_offset = 0.0; self.camera_x_offset = 0.0; self.sustain_ms = 0.0; self.set_status(format!("Loaded {} ({} sections, {} notes).", path.display(), format_count_with_commas(&self.song.notes.len().to_string()), self.total_notes())); }
                 Err(e) => self.set_status(format!("Load failed: {e}")),
@@ -1155,11 +1394,12 @@ impl ChartEditor {
                 ui.label(if self.song.audio_file_path.is_empty() { "No audio loaded".into() } else { format!("Loaded: {}", Path::new(&self.song.audio_file_path).file_name().unwrap_or_default().to_string_lossy()) });
                 if !self.audio_error.is_empty() { ui.colored_label(Color32::LIGHT_RED, &self.audio_error); }
                 if ui.button("Save Chart (JSON / BIN)").clicked() { self.save_chart_dialog(); }
-                if ui.button("Load Chart (JSON / BIN)").clicked() { self.load_chart_dialog(); }
+                if ui.button("Export Compressed Binary (.bin.zst)").clicked() { self.save_compressed_binary_dialog(); }
+                if ui.button("Load Chart (JSON / BIN / BIN.ZST)").clicked() { self.load_chart_dialog(); }
                 if ui.button("Minify JSON").clicked() { self.minify_json_dialog(); }
-                ui.label("JSON exports use the Psych-style nested { song: { ... } } layout; BIN uses FNFEBIN3.");
+                ui.label("JSON uses the Psych-style nested { song: { ... } } layout; BIN uses FNFEBIN3; BIN.ZST uses compressed FNFEBIN4 and preserves symbolic patterns.");
                 if !self.song.compressed_patterns.is_empty() {
-                    ui.colored_label(Color32::from_rgb(126, 190, 255), "Compressed patterns are preserved in Rust Editor JSON metadata; standard FNF engines do not expand them automatically.");
+                    ui.colored_label(Color32::from_rgb(126, 190, 255), "High-density patterns are preserved in Rust Editor JSON and BIN.ZST metadata; standard FNF engines do not expand them automatically.");
                 }
             }
             _ => {
@@ -1240,15 +1480,47 @@ impl eframe::App for ChartEditor {
 
         if self.show_remove_dialog {
             egui::Window::new("Remove Notes From Chart").collapsible(false).resizable(false).show(ctx, |ui| {
-                egui::ComboBox::from_label("Removal range").selected_text(match self.remove_mode { 0 => "Remove all chart notes", 1 => "Remove notes before time", _ => "Remove lane range in all sections" }).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.remove_mode, 0, "Remove all chart notes"); ui.selectable_value(&mut self.remove_mode, 1, "Remove notes before time"); ui.selectable_value(&mut self.remove_mode, 2, "Remove lane range in all sections");
+                egui::ComboBox::from_label("Removal range").selected_text(match self.remove_mode {
+                    0 => "Remove all chart notes",
+                    1 => "Remove notes before time",
+                    2 => "Remove lane range in all sections",
+                    _ => "Remove a specific number of notes",
+                }).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.remove_mode, 0, "Remove all chart notes");
+                    ui.selectable_value(&mut self.remove_mode, 1, "Remove notes before time");
+                    ui.selectable_value(&mut self.remove_mode, 2, "Remove lane range in all sections");
+                    ui.selectable_value(&mut self.remove_mode, 3, "Remove a specific number of notes");
                 });
                 if self.remove_mode == 1 { ui.add(egui::DragValue::new(&mut self.remove_before_ms).prefix("Milliseconds: ").range(0.0..=1_000_000_000.0)); }
                 if self.remove_mode == 2 { ui.horizontal(|ui| { ui.label("Lane from"); ui.add(egui::DragValue::new(&mut self.remove_lane_from).range(0..=self.song.mania.saturating_sub(1))); ui.label("to"); ui.add(egui::DragValue::new(&mut self.remove_lane_to).range(0..=self.song.mania.saturating_sub(1))); }); }
+                if self.remove_mode == 3 {
+                    ui.horizontal(|ui| {
+                        ui.label("Number of notes:");
+                        ui.add(egui::TextEdit::singleline(&mut self.remove_note_count_input).desired_width(180.0).hint_text("e.g. 1000000000"));
+                    });
+                    ui.label("Removes materialized notes from the end first, then trims high-density patterns without expanding them.");
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Remove").clicked() {
-                        self.record_undo();
-                        let bpm_step = self.storage_step_ms(); let mut removed = 0usize;
+                        if self.remove_mode == 3 {
+                            let requested = self.remove_note_count_input.clone();
+                            match normalize_count_input(&requested) {
+                                Ok(normalized) => {
+                                    self.record_undo();
+                                    match self.remove_exact_note_count(&normalized) {
+                                        Ok(removed) => {
+                                            self.selected_note = None;
+                                            self.show_remove_dialog = false;
+                                            self.set_status(format!("Removed {} notes.", format_count_for_display(&removed)));
+                                        }
+                                        Err(error) => self.set_status(error),
+                                    }
+                                }
+                                Err(_) => self.set_status("Enter a valid positive number of notes to remove."),
+                            }
+                        } else {
+                            self.record_undo();
+                            let bpm_step = self.storage_step_ms(); let mut removed = 0usize;
                         let mut global_start = 0.0;
                         for sec in &mut self.song.notes {
                             sec.notes.retain(|n| {
@@ -1295,7 +1567,8 @@ impl eframe::App for ChartEditor {
                             }
                             self.song.compressed_patterns = kept;
                         }
-                        self.selected_note = None; self.show_remove_dialog = false; self.set_status(format!("Removed {} notes.", format_count_with_commas(&removed.to_string())));
+                            self.selected_note = None; self.show_remove_dialog = false; self.set_status(format!("Removed {} notes.", format_count_with_commas(&removed.to_string())));
+                        }
                     }
                     if ui.button("Cancel").clicked() { self.show_remove_dialog = false; }
                 });
@@ -1382,6 +1655,51 @@ fn normalize_positive_decimal_integer(input: &str) -> Option<String> {
     }
     let normalized = input.trim_start_matches('0');
     if normalized.is_empty() { None } else { Some(normalized.to_string()) }
+}
+
+/// Approximate a ratio of two large decimal integers without parsing the full
+/// values into f64 (which would overflow for counts such as 10^10000). This is
+/// used only for drawing a symbolic pattern; its exact count stays in decimal text.
+fn decimal_ratio_to_f64(numerator: &str, denominator: &str) -> f64 {
+    if numerator == "0" || denominator == "0" { return 0.0; }
+    const SIGNIFICANT_DIGITS: usize = 16;
+    let n_take = numerator.len().min(SIGNIFICANT_DIGITS);
+    let d_take = denominator.len().min(SIGNIFICANT_DIGITS);
+    let n_head = numerator[..n_take].parse::<f64>().unwrap_or(0.0);
+    let d_head = denominator[..d_take].parse::<f64>().unwrap_or(1.0);
+    let n_mantissa = n_head / 10_f64.powi(n_take.saturating_sub(1) as i32);
+    let d_mantissa = d_head / 10_f64.powi(d_take.saturating_sub(1) as i32);
+    let exponent = numerator.len() as i32 - denominator.len() as i32;
+    (n_mantissa / d_mantissa) * 10_f64.powi(exponent)
+}
+
+fn decimal_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Equal => a.cmp(b),
+        ordering => ordering,
+    }
+}
+
+/// Subtract two normalized non-negative decimal integer strings. Requires a >= b.
+fn decimal_subtract(a: &str, b: &str) -> String {
+    debug_assert!(decimal_cmp(a, b).is_ge());
+    let aa = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut i = aa.len();
+    let mut j = bb.len();
+    let mut borrow = 0_i16;
+    let mut out = Vec::with_capacity(aa.len());
+    while i > 0 {
+        i -= 1;
+        let mut digit = (aa[i] - b'0') as i16 - borrow;
+        let other = if j > 0 { j -= 1; (bb[j] - b'0') as i16 } else { 0 };
+        digit -= other;
+        if digit < 0 { digit += 10; borrow = 1; } else { borrow = 0; }
+        out.push((b'0' + digit as u8) as char);
+    }
+    while out.len() > 1 && out.last() == Some(&'0') { out.pop(); }
+    let result: String = out.into_iter().rev().collect();
+    if result.is_empty() { "0".into() } else { result }
 }
 
 fn decimal_add(a: &str, b: &str) -> String {
@@ -1591,6 +1909,168 @@ impl BinCursor {
     fn boolean(&mut self) -> Result<bool, String> { Ok(self.take(1)?[0] != 0) }
     fn string(&mut self) -> Result<String, String> { let n = self.i32()?; if n < 0 || n > 16 * 1024 * 1024 { return Err("Invalid BIN string length".into()); } String::from_utf8(self.take(n as usize)?.to_vec()).map_err(|e| e.to_string()) }
 }
+/// Small streaming reader used for FNFEBIN4 so decompression does not first
+/// materialize the entire uncompressed chart in a second giant Vec<u8>.
+struct BinStreamCursor<R: Read> {
+    reader: R,
+}
+impl<R: Read> BinStreamCursor<R> {
+    fn new(reader: R) -> Self { Self { reader } }
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let mut bytes = [0u8; N];
+        self.reader.read_exact(&mut bytes).map_err(|e| format!("Truncated or unreadable compressed BIN chart: {e}"))?;
+        Ok(bytes)
+    }
+    fn i32(&mut self) -> Result<i32, String> { Ok(i32::from_be_bytes(self.bytes::<4>()?)) }
+    fn i64(&mut self) -> Result<i64, String> { Ok(i64::from_be_bytes(self.bytes::<8>()?)) }
+    fn f64(&mut self) -> Result<f64, String> { Ok(f64::from_be_bytes(self.bytes::<8>()?)) }
+    fn boolean(&mut self) -> Result<bool, String> { Ok(self.bytes::<1>()?[0] != 0) }
+    fn string(&mut self) -> Result<String, String> {
+        let length = self.i32()?;
+        if length < 0 || length > 16 * 1024 * 1024 {
+            return Err("Invalid FNFEBIN4 string length".into());
+        }
+        let mut bytes = vec![0u8; length as usize];
+        self.reader.read_exact(&mut bytes).map_err(|e| format!("Truncated FNFEBIN4 string: {e}"))?;
+        String::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8 in FNFEBIN4 string: {e}"))
+    }
+    fn ensure_eof(&mut self) -> Result<(), String> {
+        let mut extra = [0u8; 1];
+        match self.reader.read(&mut extra) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err("Unexpected trailing data after FNFEBIN4 chart".into()),
+            Err(e) => Err(format!("Could not verify compressed chart end: {e}")),
+        }
+    }
+}
+
+fn load_compressed_binary(path: &Path) -> Result<SongData, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|e| format!("Not a valid Zstandard-compressed chart: {e}"))?;
+    load_binary_v4(decoder)
+}
+
+fn load_binary_v4<R: Read>(reader: R) -> Result<SongData, String> {
+    const MAX_SECTIONS: i64 = 1_000_000;
+    const MAX_PATTERNS: i64 = 1_000_000;
+    const MAX_NOTES_PER_SECTION: i64 = 100_000_000;
+
+    let mut cursor = BinStreamCursor::new(reader);
+    let magic = cursor.string()?;
+    if magic != "FNFEBIN4" {
+        return Err(format!("Unsupported compressed BIN payload: {magic}"));
+    }
+
+    let mut song = SongData::default();
+    song.song = cursor.string()?;
+    song.bpm = cursor.f64()?.max(1.0);
+    song.needs_voices = cursor.boolean()?;
+    song.player1 = cursor.string()?;
+    song.player2 = cursor.string()?;
+    song.gf_version = cursor.string()?;
+    song.speed = cursor.f64()?.max(0.1);
+    song.mania = (cursor.i32()?.max(2) as usize).clamp(2, 64);
+
+    let section_count = cursor.i64()?;
+    if !(0..=MAX_SECTIONS).contains(&section_count) {
+        return Err(format!("Invalid FNFEBIN4 section count: {section_count}"));
+    }
+    song.notes.clear();
+    song.notes.try_reserve(section_count as usize)
+        .map_err(|e| format!("Could not allocate section table: {e}"))?;
+    let step_ms = 15_000.0 / song.bpm;
+    let mut section_start_ms = 0.0;
+
+    for _ in 0..section_count {
+        let length = cursor.i32()?.max(1) as usize;
+        let must_hit = cursor.boolean()?;
+        let note_count = cursor.i64()?;
+        if !(0..=MAX_NOTES_PER_SECTION).contains(&note_count) {
+            return Err(format!("Invalid FNFEBIN4 note count: {note_count}"));
+        }
+        let mut section = Section { length_in_steps: length, must_hit_section: must_hit, notes: Vec::new() };
+        section.notes.try_reserve(note_count as usize)
+            .map_err(|e| format!("Could not allocate section notes: {e}"))?;
+        for _ in 0..note_count {
+            let global_time = cursor.f64()?;
+            let lane = cursor.i32()?;
+            let sustain = cursor.f64()?;
+            if lane >= 0 && (lane as usize) < song.mania {
+                section.notes.push(Note {
+                    time_ms: (global_time - section_start_ms).max(0.0),
+                    lane: lane as usize,
+                    sustain_ms: sustain.max(0.0),
+                });
+            }
+        }
+        section_start_ms += section.length_in_steps as f64 * step_ms;
+        song.notes.push(section);
+    }
+    if song.notes.is_empty() {
+        song.notes.push(Section::default());
+    }
+
+    let pattern_count = cursor.i64()?;
+    if !(0..=MAX_PATTERNS).contains(&pattern_count) {
+        return Err(format!("Invalid FNFEBIN4 compressed-pattern count: {pattern_count}"));
+    }
+    song.compressed_patterns.try_reserve(pattern_count as usize)
+        .map_err(|e| format!("Could not allocate compressed-pattern table: {e}"))?;
+
+    for _ in 0..pattern_count {
+        let section_index_raw = cursor.i64()?;
+        let start_ms = cursor.f64()?;
+        let row_step_ms = cursor.f64()?;
+        let rows_raw = cursor.i64()?;
+        let density_input = cursor.string()?;
+        let strength_rows = cursor.f64()?;
+        let note_count_input = cursor.string()?;
+        let lane_from_raw = cursor.i32()?;
+        let lane_to_raw = cursor.i32()?;
+
+        let density = normalize_count_input(&density_input)
+            .map_err(|e| format!("Invalid compressed-pattern density: {e}"))?;
+        let note_count_per_lane = normalize_positive_decimal_integer(&note_count_input)
+            .ok_or_else(|| "Invalid compressed-pattern note count".to_string())?;
+        let section_index = usize::try_from(section_index_raw)
+            .map_err(|_| "Invalid compressed-pattern section index".to_string())?;
+        let rows = usize::try_from(rows_raw)
+            .map_err(|_| "Invalid compressed-pattern row count".to_string())?;
+        let lane_from = usize::try_from(lane_from_raw)
+            .map_err(|_| "Invalid compressed-pattern starting lane".to_string())?;
+        let lane_to = usize::try_from(lane_to_raw)
+            .map_err(|_| "Invalid compressed-pattern ending lane".to_string())?;
+
+        if section_index >= song.notes.len()
+            || !start_ms.is_finite() || start_ms < 0.0
+            || !row_step_ms.is_finite() || row_step_ms <= 0.0
+            || rows == 0 || rows > MAX_COMPRESSED_PATTERN_ROWS
+            || !strength_rows.is_finite() || strength_rows <= 0.0
+            || strength_rows > rows as f64 || strength_rows.ceil() as usize != rows
+            || lane_from > lane_to || lane_to >= song.mania
+        {
+            return Err("Invalid compressed-pattern metadata in FNFEBIN4".into());
+        }
+        song.compressed_patterns.push(CompressedSpamPattern {
+            section_index,
+            start_ms,
+            row_step_ms,
+            rows,
+            density,
+            strength_rows,
+            note_count_per_lane,
+            lane_from,
+            lane_to,
+        });
+    }
+
+    // Reading through EOF makes the Zstandard decoder verify the final frame,
+    // including its checksum when present, instead of stopping after the last field.
+    cursor.ensure_eof()?;
+    Ok(song)
+}
+
 fn load_binary(path: &Path) -> Result<SongData, String> {
     let data = fs::read(path).map_err(|e| e.to_string())?; let mut c = BinCursor { data, pos: 0 };
     let magic = c.string()?; if !["FNFEBIN1", "FNFEBIN2", "FNFEBIN3"].contains(&magic.as_str()) { return Err(format!("Unknown BIN chart format: {magic}")); }
@@ -1611,6 +2091,25 @@ fn load_binary(path: &Path) -> Result<SongData, String> {
         start_ms += sec.length_in_steps as f64 * step_ms; s.notes.push(sec);
     }
     if s.notes.is_empty() { s.notes.push(Section::default()); } Ok(s)
+}
+
+#[cfg(test)]
+mod remove_count_decimal_tests {
+    use super::{decimal_cmp, decimal_subtract};
+
+    #[test]
+    fn subtracts_decimal_counts_without_integer_overflow() {
+        assert_eq!(decimal_subtract("1000", "1"), "999");
+        assert_eq!(decimal_subtract("100000000000000000000", "99999999999999999999"), "1");
+        assert_eq!(decimal_subtract("123456789", "123456789"), "0");
+    }
+
+    #[test]
+    fn compares_decimal_counts_by_length_then_digits() {
+        assert!(decimal_cmp("100000000000000000000", "99999999999999999999").is_gt());
+        assert!(decimal_cmp("123456", "123457").is_lt());
+        assert!(decimal_cmp("42", "42").is_eq());
+    }
 }
 
 #[cfg(test)]
