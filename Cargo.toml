@@ -12,3 +12,4 @@ serde_json = "1.0"
 rfd = "0.15.3"
 rodio = "0.20.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+zstd = "0.13"
