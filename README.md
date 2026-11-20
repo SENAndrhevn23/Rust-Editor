@@ -1,42 +1,57 @@
-# Rust-Editor
+# 🚀 Rust-Editor
 
-> Formerly a Java chart editor, now recreated in Rust. I made it dark mode so you don't see heaven again.
+> The world's most powerful Friday Night Funkin' chart editor written in Rust. Lightweight, highly optimized, and built for performance.
 
-Rust-Editor is a native desktop recreation of a Friday Night Funkin' chart editor, built with **Rust** and **egui**. It keeps the familiar chart-editing workflow, adds a dark graphite theme, and uses a blue divider to separate the opponent and player lanes.
+Welcome to **Rust-Editor!** A modern, native Friday Night Funkin' chart editor recreated entirely in Rust.
 
-**Version target:** `v0.0.1`
+Designed to be extremely lightweight and highly optimized, Rust-Editor brings a familiar chart-editing experience with a modern dark interface, powerful editing tools, and support for large key modes.
 
-## Features
+And yes, it has dark mode. We don't want you seeing heaven again.
 
-- **Dark mode UI** with a graphite canvas, dark panels, and readable contrast.
-- **1K–32K key modes per side**, supporting up to 64 lanes total.
-- **Blue center divider** separating opponent and player lanes across key modes.
-- **Chart editing:** place, select, delete, and extend notes.
-- **Section tools:** navigate, clear, copy, paste, swap sides, stretch, shift, and duplicate sections.
-- **Chart utilities:** note-spam generation, EZ Spam, and range-based note operations.
-- **Song controls:** edit metadata and load/play audio.
-- **Import/export:** Psych-style chart JSON and the source editor's `FNFEBIN1`, `FNFEBIN2`, and `FNFEBIN3` binary formats.
-- Original note, grid, font, and character assets included under `assets/`.
+**Current version:** `v0.0.2`
 
-## Build and run
+## ✨ Features
 
-Install [Rust](https://www.rust-lang.org/tools/install) with a recent stable toolchain (Rust 1.81 or newer), clone or download this repository, then run:
+- **Modern Dark Mode** – A sleek graphite interface with dark panels and readable contrast.
+- **Highly Optimized** – Built with Rust for performance and lightweight resource usage.
+- **1K–32K Key Modes** – Supports up to 64 lanes across both sides.
+- **Blue Center Divider** – Clearly separates opponent and player lanes.
+- **Advanced Chart Editing** – Place, select, delete, and extend notes.
+- **Section Editor** – Navigate, clear, copy, paste, swap sides, stretch, shift, and duplicate sections.
+- **Chart Utilities** – Note-spam generation, EZ Spam, and range-based note operations.
+- **Song Controls** – Edit song metadata and load/play audio.
+- **Import & Export** – Supports Psych Engine-style chart JSON and `FNFEBIN1`, `FNFEBIN2`, and `FNFEBIN3` binary formats.
+- **Included Assets** – Original note, grid, font, and character assets.
 
-```sh
+## 📱 Android Support
+
+Android support is planned for a future release!
+
+The goal is to bring Rust-Editor's chart editing experience to mobile devices while maintaining its lightweight performance and usability.
+
+**Coming soon... hopefully.**
+
+## 🛠️ Build and Run
+
+Install [Rust](https://www.rust-lang.org/tools/install) with a recent stable toolchain (Rust 1.81 or newer).
+
+Clone or download the repository, open a terminal in the project directory, and run:
+
+```bash
 cargo run --release
 ```
 
-To build without launching the application:
+To compile without launching the application:
 
-```sh
+```bash
 cargo build --release
 ```
 
-### Linux dependencies
+### 🐧 Linux Dependencies
 
-On Debian/Ubuntu, the native windowing and audio backends may require these packages:
+On Debian/Ubuntu, install the following dependencies:
 
-```sh
+```bash
 sudo apt-get update
 sudo apt-get install --yes \
   build-essential \
@@ -52,13 +67,13 @@ sudo apt-get install --yes \
   libgl1-mesa-dev
 ```
 
-## Controls
+## ⌨️ Controls
 
-| Key / action | Function |
+| Key / Action | Function |
 |---|---|
 | `Space` | Start or pause playback |
-| Left click | Place or select a note |
-| Right click | Delete a note near the clicked grid cell |
+| Left Click | Place or select a note |
+| Right Click | Delete a note near the clicked grid cell |
 | `E` / `P` | Extend a note with a sustain |
 | `Z` / `X` | Zoom the chart grid out / in |
 | `N` / `M` | Adjust camera zoom |
@@ -67,28 +82,42 @@ sudo apt-get install --yes \
 | `W` / `S` | Move playback position by one step |
 | `A` / `D` | Previous / next section |
 | `R` | Swap the two lane sides for the current section |
-| Mouse wheel | Scroll through the chart |
+| Mouse Wheel | Scroll through the chart |
 
-## Cross-platform builds
+## 🌍 Cross-Platform Support
+
+Rust-Editor is designed with cross-platform compatibility in mind.
 
 The GitHub Actions workflow in `.github/workflows/main.yml` is configured to build release packages for:
 
-- Windows x86-64 (`.zip`)
-- Linux x86-64 (`.tar.gz`)
-- macOS Apple Silicon / ARM64 (`.tar.gz`)
-- macOS Intel / x86-64 (`.tar.gz`)
+| Platform | Architecture | Package |
+|---|---|---|
+| Windows | x86-64 | `.zip` |
+| Linux | x86-64 | `.tar.gz` |
+| macOS | Apple Silicon / ARM64 | `.tar.gz` |
+| macOS | Intel / x86-64 | `.tar.gz` |
 
-Push the `v0.0.1` tag to trigger the workflow's release job:
+To trigger the release workflow:
 
-```sh
+```bash
 git tag v0.0.1
 git push origin v0.0.1
 ```
 
-Builds and releases are produced by GitHub Actions; they are not generated by this README.
+Builds and releases are produced through GitHub Actions. Actual release availability depends on successful builds.
 
-## Notes and limitations
+## ⚠️ Notes & Limitations
 
-Rust-Editor aims to recreate the original chart editor's layout and behavior, but it is not a verified pixel-perfect clone of Java Swing. Extremely large charts may use more memory than the original implementation because notes and chart JSON are held in memory rather than using the Java version's memory-mapped, streaming approach.
+Rust-Editor aims to recreate the original chart editor's layout and functionality, but it is not currently a verified pixel-perfect recreation of the original Java Swing implementation.
 
-The application should be built and tested on each target platform before treating a release as verified.
+Extremely large charts may consume more memory than the original implementation because notes and chart JSON are currently held in memory rather than using the Java version's memory-mapped streaming approach.
+
+Each supported platform should be independently built and tested before considering its release verified.
+
+## ❤️ Credits
+
+Made with Rust, egui, and a lot of hard work.
+
+Thanks for checking out **Rust-Editor!**
+
+*More features, more optimizations, and more platforms are on the way.*
